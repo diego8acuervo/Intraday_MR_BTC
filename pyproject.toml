@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qsCrypto"
+version = "0.1.0"
+description = "Quantitative crypto trading framework (forked from qsforex)"
+requires-python = ">=3.10"
+dependencies = [
+    "binance-futures-connector",
+    "websocket-client",
+    "python-dotenv",
+    "pandas",
+    "numpy",
+    "requests",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+]
+
+[tool.setuptools.packages.find]
+include = ["qsCrypto*"]
+
+[tool.setuptools.package-data]
+qsCrypto = ["logging.conf"]

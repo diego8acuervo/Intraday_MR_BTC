@@ -1,0 +1,13 @@
+# qsCrypto dependencies for Python 3.11+
+binance-futures-connector
+websocket-client
+python-dotenv
+pandas
+numpy
+matplotlib
+requests
+scipy
+scikit-learn
+seaborn
+ipywidgets
+ipympl
