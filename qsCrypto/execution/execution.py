@@ -377,11 +377,20 @@ class IBKRExecutionHandler(ExecutionHandler):
         is_add = bool(getattr(event, "is_add", False))
         stop_px = getattr(event, "stop_price", None)
 
+        # `tif` nunca queda en blanco: ib_async lo inicializa a `""`, y TWS le
+        # aplica su preset de cuenta (visto en vivo: "Order TIF was set to
+        # DAY based on order preset") — igual al padre que al stop, porque
+        # nada aquí los distingue. Con un futuro CME que opera casi 24h, un
+        # STOP en DAY puede expirar en el corte de sesión y dejar la
+        # posición sin barrera de bróker justo cuando más importa (el motor
+        # puede estar caído, ver streaming.py/trading.py). GTC explícito en
+        # ambos evita depender de qué preset tenga la cuenta en TWS.
         parent = MarketOrder(action, qty)
         parent.orderId = self.ib.client.getReqId()
         parent.account = self.account
         parent.transmit = stop_px is None
         parent.outsideRth = True
+        parent.tif = "GTC"
 
         trades = [self.ib.placeOrder(contract, parent)]
         self._pending_add[parent.orderId] = is_add
@@ -394,6 +403,7 @@ class IBKRExecutionHandler(ExecutionHandler):
             stop.parentId = parent.orderId
             stop.transmit = True
             stop.outsideRth = True
+            stop.tif = "GTC"
             trades.append(self.ib.placeOrder(contract, stop))
             self.stops[pair] = trades[-1]
             self.logger.info("%s %s x%d a mercado, stop adjunto en %s",

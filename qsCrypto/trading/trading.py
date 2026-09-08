@@ -29,18 +29,26 @@ def trade(events, strategy, portfolio, execution, heartbeat, monitor=None):
 
     `monitor` es opcional y con defecto None para no alterar la llamada que ya
     hace el __main__ de Binance más abajo.
+
+    Todo el despacho va envuelto en un único try/except: antes de esto, una
+    excepción en cualquier paso (strategy/portfolio/execution) escapaba del
+    `while True` y mataba el hilo en silencio (daemon thread, sin traceback
+    visible en el notebook) — el motor dejaba de procesar barras y de emitir
+    órdenes sin que nada lo dijera. Ahora se registra, se cuenta y el bucle
+    sigue vivo para el siguiente evento.
     """
     while True:
         try:
             event = events.get(False)
         except queue.Empty:
-            pass
-        else:
-            if event is not None:
+            event = None
+        if event is not None:
+            try:
                 if event.type == 'TICK':
                     logger.info("Received new tick event: %s", event)
                     strategy.calculate_signals(event)
                     portfolio.update_portfolio(event)
+                    # print('Tick event processed', str(event.time), event.bid, event.ask)
                 elif event.type == 'BAR':
                     # La señal se calcula sobre barras cerradas; el portfolio
                     # evalúa sobre ellas las barreras de objetivo y vertical.
@@ -51,9 +59,11 @@ def trade(events, strategy, portfolio, execution, heartbeat, monitor=None):
                 elif event.type == 'SIGNAL':
                     logger.info("Received new signal event: %s", event)
                     portfolio.execute_signal(event)
+                    #print('Signal event processed', str(event.time), event.side)
                 elif event.type == 'ORDER':
                     logger.info("Received new order event: %s", event)
                     execution.execute_order(event)
+                    # print('Order event processed', event.instrument, event.units, event.side)
                 elif event.type == 'FILL':
                     # La vuelta del bucle: lo que el bróker ejecutó de verdad
                     # regresa al portfolio, que hasta aquí solo sabía lo que
@@ -65,6 +75,14 @@ def trade(events, strategy, portfolio, execution, heartbeat, monitor=None):
                     logger.info("Received new portfolio event: %s", event)
                     if monitor is not None:
                         monitor.record(event)
+            except Exception:
+                logger.exception(
+                    "Error despachando evento %s: se descarta y el motor "
+                    "sigue vivo.", getattr(event, "type", event))
+                if monitor is not None and hasattr(monitor, "record_error"):
+                    monitor.record_error(getattr(event, "type", "desconocido"))
+        if monitor is not None and hasattr(monitor, "heartbeat"):
+            monitor.heartbeat()
         time.sleep(heartbeat)
 
 

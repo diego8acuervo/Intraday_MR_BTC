@@ -58,7 +58,7 @@ Our environments are fully standardized. Follow these precise instructions to in
 ### Prerequisites & Dependencies
 To ensure this repository is executable on any Operating System (macOS, Linux, Windows), we manage environments cleanly either via standard `venv` or `make`. 
 
-*   **Python:** Version `3.11.x` is strictly recommended. Native compatibility is guaranteed inside our Makefile.
+*   **Python:** Version `3.11.x` is strictly recommended (tested and integrated with Python `3.11.9`).
 *   **Active Gateway/TWS:** Ensure Interactive Brokers Trader Workstation (TWS) or IB Gateway is running in **Paper Trading mode** before launching.
 
 ### Standard Setup (For any OS)
@@ -67,22 +67,23 @@ Choose either the automated build command or step-by-step raw terminal execution
 #### Option A: Automated environment setup (Makefile)
 Simply open your shell in the root of `/Users/diegoochoa/Projects/Intraday_MR_BTC` and run:
 ```bash
-# Sets up a virtual environment (.venv), installs all dependencies, and prints verification instructions
+# Sets up a virtual environment (.venv) using Python 3.11, installs all dependencies (including ib_async, nest_asyncio, and Jupyter tooling), and prints verification instructions
 make bootstrap
 ```
 
 #### Option B: Step-by-Step Manual Setup (Cross-Platform compatibility)
 If `make` is unavailable on your OS (e.g., native Windows without WSL):
 
-1.  **Create your Environment:**
+1.  **Create your Environment (Python 3.11 Recommended):**
     ```bash
-    python3 -m venv .venv
+    python3.11 -m venv .venv
     source .venv/bin/activate  # On Windows: .venv\Scripts\activate
     ```
-2.  **Install Requirements:**
+2.  **Install Requirements & Notebook/Live-trading Packages (`ib_async`, `nest_asyncio`):**
     ```bash
-    pip install --upgrade pip
+    pip install --upgrade pip setuptools wheel
     pip install -r requirements.txt
+    pip install ib_async nest_asyncio jupyterlab ipywidgets ipympl
     pip install -e .
     ```
 3.  **Environment Variables:**

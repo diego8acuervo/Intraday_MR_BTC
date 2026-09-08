@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+from datetime import datetime, timezone
 from decimal import Decimal, getcontext, ROUND_HALF_DOWN
 import json
 import logging
@@ -300,6 +301,12 @@ class IBKRPriceHandler(PriceHandler):
     bucle de trading, igual que StreamingBitgetPrices.
     """
 
+    _MAX_CONSECUTIVE_PUMP_ERRORS = 5
+    _STALE_CHECK_EVERY_S = 60      # cadencia de la comprobación de obsolescencia
+    _MAX_TICK_STALE_S = 120        # sin un tick en 2 min: la línea está muerta
+    _MAX_BAR_STALE_FACTOR = 1.5    # 1.5x el tamaño de barra sin barra nueva
+    _RESUBSCRIBE_COOLDOWN_S = 300  # no reintentar más de 1 vez cada 5 min
+
     def __init__(self, pairs, events_queue, ib=None, exchange="CME",
                  currency="USD", bar_size="30 mins", use_rth=True,
                  what_to_show="TRADES", warmup_bars=120, roll_days=2,
@@ -323,6 +330,14 @@ class IBKRPriceHandler(PriceHandler):
         self._bar_subs = {}
         self._tickers = {}
         self._last_bar_time = {}
+        # Marca de tiempo REAL (datetime, no el string de `self.prices`) del
+        # último tick y del último bombeo del loop de ib_async — lo que el
+        # monitor necesita para distinguir "el feed está vivo pero tranquilo"
+        # de "el hilo se congeló": `self.prices[pair]["time"]` puede quedarse
+        # como estaba desde hace horas sin que nada más lo delate.
+        self.last_tick_at = {p: None for p in self.pairs}
+        self.last_pump_at = None
+        self._last_resubscribe_at = None
         self.continue_backtest = True
         self._running = False
 
@@ -423,8 +438,17 @@ class IBKRPriceHandler(PriceHandler):
         return self.history
 
     def _duration_for(self, n_bars):
-        secs = {"1 min": 60, "5 mins": 300, "15 mins": 900, "30 mins": 1800,
-                "1 hour": 3600, "1 day": 86400}.get(self.bar_size, 1800)
+        secs = {"1 secs": 1, "5 secs": 5, "10 secs": 10, "15 secs": 15,
+                "30 secs": 30, "1 min": 60, "5 mins": 300, "15 mins": 900,
+                "30 mins": 1800, "1 hour": 3600, "1 day": 86400
+                }.get(self.bar_size, 1800)
+        if secs < 60:
+            # IBKR limita la duración de peticiones de barras SUB-MINUTO a
+            # más o menos 1 día (28.800s para 30 segs, menos para tamaños
+            # menores). El cálculo de días de abajo está pensado para
+            # barras de minutos+; aplicado aquí pediría "2 D" o más y la
+            # petición revienta con un error de duración inválida de IBKR.
+            return "1 D"
         days = max(2, int((n_bars * secs) / (6.5 * 3600)) + 2)
         return "%d D" % min(days, 60)
 
@@ -491,6 +515,7 @@ class IBKRPriceHandler(PriceHandler):
                 self.prices[pair]["bid"] = bid_d
                 self.prices[pair]["ask"] = ask_d
                 self.prices[pair]["time"] = tval
+                self.last_tick_at[pair] = datetime.now(timezone.utc)
                 self.events_queue.put(TickEvent(pair, tval, bid_d, ask_d))
             except Exception as exc:
                 self.logger.error("Error procesando ticker: %s", exc)
@@ -515,14 +540,126 @@ class IBKRPriceHandler(PriceHandler):
             bars.updateEvent += self._on_bar_update
         self.ib.pendingTickersEvent += self._on_pending_tickers
 
+    def _unsubscribe_quietly(self):
+        """Cancela lo que haya, tragándose los fallos: es limpieza antes de
+        volver a suscribirse, no el cierre final (`stop()` hace eso y sí
+        registra sus fallos)."""
+        try:
+            self.ib.pendingTickersEvent -= self._on_pending_tickers
+        except Exception:
+            pass
+        for pair, bars in list(self._bar_subs.items()):
+            try:
+                self.ib.cancelHistoricalData(bars)
+            except Exception:
+                pass
+        for pair in list(self._tickers):
+            try:
+                self.ib.cancelMktData(self.contracts[pair])
+            except Exception:
+                pass
+        self._bar_subs.clear()
+        self._tickers.clear()
+
+    def _resubscribe(self):
+        self._unsubscribe_quietly()
+        self.subscribe()
+
+    def _check_staleness(self, now):
+        """Detecta un feed muerto SIN excepción — el caso que el reintento
+        de `stream_to_queue` no cubre. Un farm de datos de IBKR puede
+        dejar de entregar ticks/barras sin que `ib.sleep()` lance nada: el
+        bombeo sigue "sano" (`last_pump_at` se actualiza cada segundo) pero
+        no llega un solo dato nuevo. Se comprueba cada
+        `_STALE_CHECK_EVERY_S` segundos y, si hace más de
+        `_MAX_TICK_STALE_S` que no llega un tick o más de
+        `_MAX_BAR_STALE_FACTOR` veces el tamaño de barra que no cierra una,
+        se fuerza una resuscripción — con un enfriamiento mínimo entre
+        intentos para no entrar en una tormenta de reqMktData si el mercado
+        de verdad está cerrado (mantenimiento diario del CME, fin de
+        semana).
+        """
+        bar_secs = {"1 min": 60, "5 mins": 300, "15 mins": 900,
+                    "30 mins": 1800, "1 hour": 3600, "1 day": 86400
+                    }.get(self.bar_size, 1800)
+        stale_pairs = []
+        for pair in self.pairs:
+            tick_at = self.last_tick_at.get(pair)
+            tick_stale = (tick_at is None or
+                         (now - tick_at).total_seconds() > self._MAX_TICK_STALE_S)
+            last_bar_ts = self._last_bar_time.get(pair)
+            bar_stale = (last_bar_ts is not None and
+                        (now.replace(tzinfo=None) - last_bar_ts).total_seconds()
+                        > bar_secs * self._MAX_BAR_STALE_FACTOR)
+            if tick_stale or bar_stale:
+                stale_pairs.append(pair)
+        if not stale_pairs:
+            return
+        if (self._last_resubscribe_at is not None and
+                (now - self._last_resubscribe_at).total_seconds()
+                < self._RESUBSCRIBE_COOLDOWN_S):
+            return
+        self.logger.critical(
+            "Feed obsoleto sin excepción en %s (posible farm de IBKR caído "
+            "en silencio): reabriendo suscripciones.", stale_pairs)
+        self._last_resubscribe_at = now
+        try:
+            self._resubscribe()
+        except Exception as exc:
+            self.logger.critical("Reabrir suscripciones también falló: %s", exc)
+
     def stream_to_queue(self):
+        """Bombea el loop de ib_async. Es el ÚNICO hilo que lo hace.
+
+        `ib.sleep(1)` es lo que entrega los callbacks de ticks/barras: si
+        se bloquea o lanza (hipo de red, farm de datos reiniciando) y la
+        excepción escapa sin más, este `while` se para y el hilo muere en
+        silencio — `thread.is_alive()` lo delata, pero nada reintenta nada.
+        Un fallo aislado se registra y se sigue; una racha de fallos
+        (`_MAX_CONSECUTIVE_PUMP_ERRORS` seguidos) intenta resuscribirse antes
+        de rendirse, porque un `reqMktData`/`reqHistoricalData` cuya
+        suscripción se cayó en el bróker no se repara solo con reintentar el
+        `sleep`. Eso cubre el bombeo roto; `_check_staleness` cubre el otro
+        caso, más traicionero: el bombeo sigue sano pero la suscripción dejó
+        de entregar datos sin lanzar nada.
+        """
         if not self.history:
             self.warmup()
         self.subscribe()
         self._running = True
+        self.last_pump_at = datetime.now(timezone.utc)
+        self._last_resubscribe_at = None
+        last_stale_check = self.last_pump_at
         self.logger.info("Streaming IBKR arrancado sobre %s", self.pairs)
+        consecutive_errors = 0
         while self._running:
-            self.ib.sleep(1)
+            try:
+                self.ib.sleep(1)
+                self.last_pump_at = datetime.now(timezone.utc)
+                consecutive_errors = 0
+            except Exception as exc:
+                consecutive_errors += 1
+                self.logger.error(
+                    "Error bombeando streaming (%d seguidos): %s",
+                    consecutive_errors, exc)
+                if consecutive_errors >= self._MAX_CONSECUTIVE_PUMP_ERRORS:
+                    self.logger.critical(
+                        "%d fallos seguidos bombeando streaming: "
+                        "reintentando suscripción.", consecutive_errors)
+                    try:
+                        self.subscribe()
+                        consecutive_errors = 0
+                    except Exception as sub_exc:
+                        self.logger.critical(
+                            "Resuscripción también falló: %s. El hilo sigue "
+                            "vivo pero el feed puede seguir muerto.", sub_exc)
+                _time.sleep(1)
+                continue
+
+            now = self.last_pump_at
+            if (now - last_stale_check).total_seconds() >= self._STALE_CHECK_EVERY_S:
+                last_stale_check = now
+                self._check_staleness(now)
 
     def stop(self):
         self._running = False

@@ -1,6 +1,7 @@
 from __future__ import print_function
 
 from copy import deepcopy
+from datetime import timezone
 import math
 from decimal import Decimal, getcontext, ROUND_HALF_DOWN
 import logging
@@ -307,6 +308,252 @@ class IBKRFuturesPortfolio(Portfolio):
         self.meta = {}
         self.rejected = {"qty_cero": 0, "apalancamiento": 0, "topes": 0}
 
+    # ── reconciliación con el bróker ─────────────────────────────────────────
+    def _vwap_from_executions(self, ib, contract, account=None):
+        """VWAP de entrada + hora del primer fill, de las ejecuciones REALES
+        del día — no de `avgCost`, que IBKR no siempre reporta con la misma
+        convención (y que para un futuro exige dividir por el multiplicador
+        adivinando la convención correcta).
+
+        Camina las ejecuciones de hoy en orden y lleva una base de costo
+        corriente: los fills que amplían la posición (misma dirección o
+        posición en cero) suman al costo medio; un fill en dirección
+        contraria se trata como reducción a ese mismo costo medio, tal como
+        lo hace el propio bróker. Si la posición pasa por cero y se vuelve a
+        abrir en el mismo día, la base se reinicia — solo interesa la
+        entrada de la posición VIVA ahora mismo.
+
+        Devuelve `(vwap, hora_primer_fill, num_fills_de_entrada)`, o
+        `(None, None, 0)` si no hay ejecuciones utilizables (p.ej. la
+        posición es de un día anterior y `reqExecutions` sin filtro de
+        tiempo no la trae completa).
+        """
+        try:
+            from ib_async import ExecutionFilter
+            filt = ExecutionFilter()
+            if account:
+                filt.acctCode = account
+            fills = ib.reqExecutions(filt)
+        except Exception as exc:
+            self.logger.warning("reqExecutions falló: %s", exc)
+            return None, None, 0
+
+        fills = [f for f in fills if f.contract.conId == contract.conId
+                 and (not account or f.execution.acctNumber == account)]
+        fills.sort(key=lambda f: f.time)
+
+        running_qty, running_cost = 0.0, 0.0
+        entry_time, n_fills = None, 0
+        for f in fills:
+            signed = f.execution.shares if f.execution.side == "BOT" \
+                else -f.execution.shares
+            same_dir = running_qty == 0 or (running_qty > 0) == (signed > 0)
+            if same_dir:
+                running_cost += f.execution.price * abs(signed)
+                running_qty += signed
+                n_fills += 1
+                if entry_time is None:
+                    entry_time = f.time
+            else:
+                avg = running_cost / abs(running_qty) if running_qty else 0.0
+                running_qty += signed
+                if running_qty == 0:
+                    entry_time, n_fills = None, 0
+                    running_cost = 0.0
+                else:
+                    running_cost = avg * abs(running_qty)
+        if running_qty == 0:
+            return None, None, 0
+        return running_cost / abs(running_qty), entry_time, n_fills
+
+    def _find_resting_stop(self, ib, contract, account=None):
+        """Orden STP abierta sobre el contrato, mirando TODOS los clientes.
+
+        `ib.reqOpenOrders()` a secas solo devuelve las órdenes del `clientId`
+        de esta conexión — un stop colocado por otra sesión, por TWS a mano,
+        o sobrevivido a un reinicio con un `clientId` distinto queda
+        invisible y `reconcile_from_broker` reportaría "sin stop" con el
+        stop vivo delante. `reqAllOpenOrders()` sí ve todos los clientes de
+        la cuenta; se combinan ambas por si acaso una sola de las dos falla.
+        """
+        orders, seen = [], set()
+        for fetch in (ib.reqAllOpenOrders, ib.reqOpenOrders):
+            try:
+                for oo in fetch():
+                    key = (getattr(oo.order, "orderId", None),
+                           getattr(oo.order, "account", None))
+                    if key not in seen:
+                        seen.add(key)
+                        orders.append(oo)
+            except Exception as exc:
+                self.logger.warning("%s falló: %s", fetch.__name__, exc)
+        for oo in orders:
+            if (oo.contract.conId == contract.conId
+                    and str(oo.order.orderType).startswith("STP")
+                    and (account is None or oo.order.account == account)):
+                return float(oo.order.auxPrice), int(oo.order.totalQuantity)
+        return None, None
+
+    def reconcile_from_broker(self, ib, contracts, account=None):
+        """Reconstruye posiciones desde el estado REAL de la cuenta.
+
+        `self.positions` nace vacío en `__init__` pase lo que pase en la
+        cuenta: si el kernel se reinició con una posición todavía abierta (o
+        si la abrió una sesión anterior), este portfolio no tiene forma de
+        saberlo por sí solo — `snapshot()` devolvería `[]` para siempre y el
+        motor podría incluso intentar abrir una segunda posición encima de
+        la real. Llamar a esto una vez, justo después de construir el
+        portfolio y antes de arrancar los hilos, cierra ese hueco.
+
+        La cantidad y el lado vienen de `ib.positions()` (la única fuente
+        fiable de "hay posición ahora"); el precio de entrada y la hora del
+        primer fill vienen de `_vwap_from_executions` (las ejecuciones REALES
+        del día, no `avgCost`); el stop vigente de `_find_resting_stop`
+        (mirando todos los `clientId`, no solo el de esta sesión). El canal
+        (`level`/`mid`) se aproxima con el Donchian ACTUAL de la estrategia
+        (`strategy._channel`) — es una aproximación, no el canal congelado en
+        la ruptura original que ya no existe en ningún sitio, pero es mucho
+        mejor que renunciar al objetivo por completo; se marca `reconciled`
+        para que quede claro en el journal. `bars` se reconstruye contando
+        las barras cerradas desde el primer fill, en vez de arrancar
+        siempre en 0.
+
+        Si no encuentra una orden de stop abierta, dispara un log CRITICAL:
+        significa que la posición está, en ese instante, sin barrera
+        automática — requiere intervención manual en TWS.
+
+        También reconcilia en la dirección CONTRARIA: si `self.positions`
+        tiene un símbolo que el bróker ya no tiene, lo purga localmente. Es
+        el mismo hueco que "el bróker tiene algo que el local no ve", pero
+        al revés — puede pasar si `_exit()` cerró de verdad en el bróker
+        pero la contabilidad local (`close_position`) falló a medio camino
+        y dejó una posición fantasma: el motor seguiría creyendo que hay
+        algo que gestionar (bloqueando nuevas señales del símbolo) sobre
+        algo que ya no existe.
+        """
+        # ── purga de posiciones LOCALES sin contrapartida en el bróker ──
+        for pair in list(self.positions.keys()):
+            contract = contracts.get(pair)
+            if contract is None:
+                continue
+            still_open = any(
+                p.contract.conId == contract.conId and float(p.position) != 0
+                and (account is None or p.account == account)
+                for p in ib.positions()
+            )
+            if not still_open:
+                self.logger.critical(
+                    "%s: posición local sin contrapartida en el bróker "
+                    "(huérfana de un cierre previo). Se purga localmente "
+                    "sin PnL exacto — revisa el journal/TWS para el "
+                    "resultado real.", pair)
+                self.positions.pop(pair, None)
+                self.meta.pop(pair, None)
+                self._sync_strategy()
+
+        for pair, contract in contracts.items():
+            if pair in self.positions:
+                continue
+            matches = [
+                p for p in ib.positions()
+                if p.contract.conId == contract.conId
+                and float(p.position) != 0
+                and (account is None or p.account == account)
+            ]
+            if not matches:
+                continue
+            ib_pos = matches[0]
+            qty = int(round(float(ib_pos.position)))
+            side = 1 if qty > 0 else -1
+
+            entry_px, entry_time, n_fills = self._vwap_from_executions(
+                ib, contract, account)
+            if entry_px is None:
+                mult = self.multiplier(pair) or 1.0
+                entry_px = float(ib_pos.avgCost) / mult
+                entry_time, n_fills = None, 1
+                self.logger.warning(
+                    "Sin ejecuciones de hoy para %s: uso avgCost=%.5f como "
+                    "entrada aproximada (posible posición de un día "
+                    "anterior).", pair, entry_px)
+
+            stop_px, stop_qty = self._find_resting_stop(ib, contract, account)
+
+            n_est, level, mid = None, None, None
+            hist = getattr(self.strategy, "history", {}).get(pair) \
+                if self.strategy is not None else None
+            if hist is not None and len(hist):
+                if hasattr(self.strategy, "_n"):
+                    try:
+                        n_est = float(self.strategy._n(hist))
+                    except Exception:
+                        n_est = None
+                if hasattr(self.strategy, "_channel"):
+                    try:
+                        ent_hi, ent_lo, mid_val = self.strategy._channel(hist)
+                        if mid_val is not None:
+                            level, mid = ent_hi, mid_val
+                    except Exception:
+                        pass
+
+            bars_elapsed = 0
+            h = self.ticker.history.get(pair) if entry_time is not None else None
+            if h is not None and len(h):
+                et = entry_time
+                if getattr(et, "tzinfo", None) is not None:
+                    et = et.astimezone(timezone.utc).replace(tzinfo=None)
+                bars_elapsed = int((h.index > et).sum())
+
+            # `Position()` exige un bid/ask utilizable en el instante de
+            # construirse (`set_up_currencies`). Esto se llama justo después
+            # de construir el portfolio, ANTES de arrancar el streaming, así
+            # que `self.ticker.prices[pair]` todavía tiene bid/ask en None —
+            # `Decimal(str(None))` revienta con InvalidOperation. Se pide un
+            # snapshot puntual solo para poder construir el objeto; el ancla
+            # de entrada real (`entry_px`, de las ejecuciones) se reaplica
+            # justo después con `reanchor_entry` — si se dejara el snapshot
+            # como ancla, R y el MAE/MFE se medirían contra el precio actual
+            # del mercado en vez de contra la entrada real.
+            snap_bid = snap_ask = None
+            try:
+                tk = ib.reqTickers(contract)[0]
+                if tk.bid is not None and tk.bid == tk.bid and tk.bid > 0:
+                    snap_bid = float(tk.bid)
+                if tk.ask is not None and tk.ask == tk.ask and tk.ask > 0:
+                    snap_ask = float(tk.ask)
+            except Exception as exc:
+                self.logger.warning(
+                    "Snapshot de precio para %s falló: %s", pair, exc)
+            self.ticker.prices[pair]["bid"] = snap_bid or entry_px
+            self.ticker.prices[pair]["ask"] = snap_ask or entry_px
+
+            self.add_new_position(
+                "long" if side > 0 else "short", pair, abs(qty), self.ticker,
+                initial_stop=stop_px,
+            )
+            self.positions[pair].reanchor_entry(entry_px)
+            self.meta[pair] = {
+                "side": side, "n": n_est, "level": level, "mid": mid,
+                "units": max(1, min(n_fills, self.max_units)), "last_fill": entry_px,
+                "stop": stop_px, "bars": bars_elapsed, "qty": abs(qty),
+                "reconciled": True,
+            }
+            self._sync_strategy()
+            tag = "%s %s x%d @ %.5f (%d fill(s), %d barra(s) desde entrada)" % (
+                pair, "long" if side > 0 else "short", abs(qty), entry_px,
+                n_fills, bars_elapsed)
+            if stop_px is None:
+                self.logger.critical(
+                    "RECONCILIADA %s SIN STOP detectado en el bróker (ni por "
+                    "clientId propio ni por reqAllOpenOrders): sin barrera "
+                    "automática hasta colocar uno manualmente en TWS.", tag)
+            else:
+                self.logger.warning(
+                    "RECONCILIADA %s stop=%.5f (qty orden=%s) mid≈%s "
+                    "(aproximado, no el canal original).",
+                    tag, stop_px, stop_qty, mid)
+        self._emit_state("reconcile")
+
     # ── sizing ──────────────────────────────────────────────────────────────
     def multiplier(self, pair):
         return float(self.specs.get(pair, {}).get("multiplier", 1.0))
@@ -437,11 +684,13 @@ class IBKRFuturesPortfolio(Portfolio):
         hi, lo = float(bar_event.high), float(bar_event.low)
         flat = hi <= lo and (bar_event.volume or 0) <= 0
 
-        stop_px = m["stop"]
-        hit_stop = (not flat) and ((lo <= stop_px) if side > 0 else (hi >= stop_px))
+        stop_px = m.get("stop")
+        hit_stop = (not flat) and stop_px is not None and (
+            (lo <= stop_px) if side > 0 else (hi >= stop_px))
 
-        take_px = m["mid"] if self.tp_mode == "mid_channel" else (
-            m["last_fill"] + sd * self.take_n * m["n"])
+        take_px = m.get("mid") if self.tp_mode == "mid_channel" else (
+            (m["last_fill"] + sd * self.take_n * m["n"])
+            if m.get("n") is not None else None)
         hit_take = (not flat) and take_px is not None and (
             (hi >= take_px) if side > 0 else (lo <= take_px))
 
@@ -455,9 +704,14 @@ class IBKRFuturesPortfolio(Portfolio):
             self._try_add(pair, bar_event)
 
     def _try_add(self, pair, bar_event):
-        """Escalera Turtle: una unidad más cada ½N, hasta `max_units`."""
+        """Escalera Turtle: una unidad más cada ½N, hasta `max_units`.
+
+        Una posición reconciliada desde el bróker sin N conocido (ver
+        `reconcile_from_broker`) no puede calcular el disparador de la
+        escalera: se abstiene de añadir en vez de adivinar.
+        """
         m = self.meta[pair]
-        if m["units"] >= self.max_units:
+        if m["units"] >= self.max_units or m.get("n") is None:
             return
         side, sd = m["side"], float(m["side"])
         # `add_until_mid`: no se engorda una posición que ya llegó al objetivo.
@@ -488,7 +742,24 @@ class IBKRFuturesPortfolio(Portfolio):
     def _exit(self, pair, price, reason):
         m = self.meta.pop(pair, None)
         if pair in self.positions:
-            self.close_position(pair)
+            try:
+                self.close_position(pair)
+            except Exception as exc:
+                # `close_position` calcula PnL contra el precio actual del
+                # ticker: si en ese instante `self.ticker.prices[pair]` no
+                # tiene bid/ask utilizable, revienta. Sin este try/except la
+                # posición quedaba "fantasma": nunca se borraba de
+                # `self.positions`, así que el motor seguía creyendo que
+                # había algo que gestionar (bloqueando nuevas señales del
+                # mismo símbolo) sobre una posición que el bróker ya cerró.
+                # Se fuerza el cierre local igual — sin el PnL exacto, que
+                # hay que reconstruir del journal/TWS — porque una
+                # contabilidad incompleta es preferible a un motor
+                # atascado sobre un fantasma.
+                self.logger.error(
+                    "close_position(%s) falló: %s — se purga localmente "
+                    "sin PnL exacto.", pair, exc)
+                self.positions.pop(pair, None)
         if self.execution is not None:
             try:
                 self.execution.flatten(pair, reason=reason)

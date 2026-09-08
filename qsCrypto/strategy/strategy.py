@@ -263,7 +263,18 @@ class MeanReversionFadeStrategy(object):
             self.history[pair] = self.history[pair][-self.max_history:]
 
         bars = self.history[pair]
+        # Traza de auditoría: una línea INFO por barra cerrada, exista o no
+        # señal. Antes de esto, el log solo dejaba rastro en el caso raro de
+        # una señal emitida — todas las demás ramas (esperando historial,
+        # posición abierta bloqueando, confirmación rechazada, sin ruptura)
+        # volvían en silencio y no había forma de distinguir "el motor no
+        # está viendo nada" de "no hubo nada que ver".
+        self.logger.info(
+            "BAR %s %s O=%.5f H=%.5f L=%.5f C=%.5f (%d/%d barras)",
+            pair, event.time, bar["open"], bar["high"], bar["low"],
+            bar["close"], len(bars), self.min_bars())
         if len(bars) < self.min_bars():
+            self.logger.info("%s: historial insuficiente, se descarta la barra.", pair)
             return
 
         flat = is_flat_bar(bar["high"], bar["low"], bar["volume"])
@@ -274,6 +285,10 @@ class MeanReversionFadeStrategy(object):
             if pend is not None:
                 self.rejected["posicion_abierta"] += 1
                 self.pending[pair] = None
+                self.logger.info(
+                    "%s: posición ya abierta, se descarta la señal pendiente.", pair)
+            else:
+                self.logger.info("%s: posición ya abierta, no se evalúa señal.", pair)
             return
 
         # ── etapa 3: abrir ──
@@ -285,7 +300,8 @@ class MeanReversionFadeStrategy(object):
                 n=pend["n"], level=pend["level"], mid=pend["mid"],
             )
             self.events.put(signal)
-            self.logger.info("Señal %s %s n=%.5f nivel=%.5f mid=%.5f",
+            self.logger.info("Señal %s %s n=%.5f nivel=%.5f mid=%.5f -> "
+                             "puesta en la cola de eventos",
                              signal.side, pair, pend["n"], pend["level"],
                              pend["mid"])
             return
@@ -296,23 +312,34 @@ class MeanReversionFadeStrategy(object):
                 # Un cierre plano no confirma nada.
                 self.rejected["plana"] += 1
                 self.pending[pair] = None
+                self.logger.info(
+                    "%s: barra plana no confirma la ruptura pendiente, se descarta.",
+                    pair)
                 return
             ok = ((bar["close"] < pend["level"]) if pend["side"] > 0
                   else (bar["close"] > pend["level"]))
             if not ok:
                 self.rejected["sin_confirmar"] += 1
                 self.pending[pair] = None
+                self.logger.info(
+                    "%s: ruptura NO confirmada (close=%.5f vs nivel=%.5f), "
+                    "se descarta sin reintento.", pair, bar["close"], pend["level"])
                 return
             self.pending[pair] = dict(pend, etapa="abrir")
+            self.logger.info(
+                "%s: ruptura CONFIRMADA (close=%.5f vs nivel=%.5f) -> "
+                "señal en la próxima barra.", pair, bar["close"], pend["level"])
             return
 
         # ── etapa 1: detectar ruptura ──
         n_val = self._n(bars)
         if not (n_val == n_val) or n_val <= 0:      # NaN o no positivo
             self.rejected["sin_n"] += 1
+            self.logger.info("%s: N inválido (%.5f), se descarta la barra.", pair, n_val)
             return
         ent_hi, ent_lo, mid = self._channel(bars)
         if ent_hi is None:
+            self.logger.info("%s: canal aún no calculable.", pair)
             return
 
         if bar["high"] > ent_hi:
@@ -320,11 +347,17 @@ class MeanReversionFadeStrategy(object):
         elif self.allow_short and bar["low"] < ent_lo:
             brk, level = -1, ent_lo
         else:
+            self.logger.info(
+                "%s: sin ruptura (H=%.5f/L=%.5f dentro de canal [%.5f, %.5f]).",
+                pair, bar["high"], bar["low"], ent_lo, ent_hi)
             return
 
         etapa = "confirmar" if self.require_confirmation else "abrir"
         self.pending[pair] = {"side": brk, "n": n_val, "level": float(level),
                               "mid": float(mid), "etapa": etapa}
+        self.logger.info(
+            "%s: RUPTURA side=%s level=%.5f n=%.5f -> etapa=%s",
+            pair, "alcista" if brk > 0 else "bajista", level, n_val, etapa)
 
     # ── el portfolio informa de qué símbolos tienen posición ────────────────
     def set_open_symbols(self, symbols):
