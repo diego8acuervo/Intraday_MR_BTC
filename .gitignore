@@ -42,3 +42,8 @@ output/
 # Los journals de ejecución (.jsonl/.csv) no se versionan; los documentos sí.
 journals/*
 !journals/*.md
+
+# Binance historical data cache: 24MB+ and freely re-fetchable from the
+# public REST API (no key needed) via qsCrypto.backtest.binance_data —
+# unlike the small IBKR cache, not worth tracking.
+data_cache/binance/
