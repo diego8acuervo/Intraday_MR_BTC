@@ -1,0 +1,116 @@
+# Coinbase50 ∩ Binance USD-M Perpetuals — static, manually-curated universe.
+#
+# This file is NOT fetched or reconciled against Coinbase/Binance APIs at
+# runtime (see plan decision #3) — it is a hand-curated snapshot that must be
+# reviewed periodically as Coinbase50 constituents and Binance perpetual
+# listings change. Use qsCrypto/data/tickerMap.py's
+# build_coinbase50_binance_universe() helper offline to refresh the draft
+# rows, then re-curate by hand before committing changes here.
+#
+# `pilot: true` rows are the live pilot subset (decision #4: 3-5 coins).
+# `corr_group` keys must match a key in `correlation_groups` below, and
+# should stay consistent with qsCrypto/portfolio/turtle_risk_units.py's
+# CORRELATION_GROUPS, which remains the reference taxonomy — do not fork a
+# second, inconsistent grouping here.
+
+universe_name: coinbase50_pilot_v1
+generated: "2026-09-09"
+source: "Coinbase50 constituents intersected with Binance USD-M perpetual listings, manually curated"
+base_currency: USDT
+
+symbols:
+  # ---- Pilot (live) ----
+  - generic: BTC
+    binance_symbol: BTCUSDT
+    corr_group: layer1_major
+    pilot: true
+    risk_overrides: {}
+
+  - generic: ETH
+    binance_symbol: ETHUSDT
+    corr_group: layer1_major
+    pilot: true
+    risk_overrides: {}
+
+  - generic: SOL
+    binance_symbol: SOLUSDT
+    corr_group: layer1_alt
+    pilot: true
+    risk_overrides:
+      max_units: 3   # higher-beta name, tighter per-symbol cap
+
+  - generic: AVAX
+    binance_symbol: AVAXUSDT
+    corr_group: layer1_alt
+    pilot: true
+    risk_overrides:
+      max_units: 3
+
+  - generic: LINK
+    binance_symbol: LINKUSDT
+    corr_group: defi
+    pilot: true
+    risk_overrides: {}
+
+  # ---- Curated, not yet in the pilot (pilot: false) ----
+  - generic: XRP
+    binance_symbol: XRPUSDT
+    corr_group: layer1_alt
+    pilot: false
+    risk_overrides: {}
+
+  - generic: ADA
+    binance_symbol: ADAUSDT
+    corr_group: layer1_alt
+    pilot: false
+    risk_overrides: {}
+
+  - generic: DOT
+    binance_symbol: DOTUSDT
+    corr_group: layer1_alt
+    pilot: false
+    risk_overrides: {}
+
+  - generic: NEAR
+    binance_symbol: NEARUSDT
+    corr_group: layer1_alt
+    pilot: false
+    risk_overrides: {}
+
+  - generic: DOGE
+    binance_symbol: DOGEUSDT
+    corr_group: meme
+    pilot: false
+    risk_overrides: {}
+
+  - generic: AAVE
+    binance_symbol: AAVEUSDT
+    corr_group: defi
+    pilot: false
+    risk_overrides: {}
+
+  - generic: UNI
+    binance_symbol: UNIUSDT
+    corr_group: defi
+    pilot: false
+    risk_overrides: {}
+
+  - generic: LTC
+    binance_symbol: LTCUSDT
+    corr_group: legacy
+    pilot: false
+    risk_overrides: {}
+
+  - generic: BCH
+    binance_symbol: BCHUSDT
+    corr_group: legacy
+    pilot: false
+    risk_overrides: {}
+
+correlation_groups:
+  layer1_major: {max_corr_units: 6}
+  layer1_alt:   {max_corr_units: 6}
+  meme:         {max_corr_units: 6}
+  defi:         {max_corr_units: 6}
+  legacy:       {max_corr_units: 6}
+  exchange:     {max_corr_units: 6}

@@ -18,6 +18,7 @@ dependencies = [
     "scikit-learn",
     "matplotlib",
     "seaborn",
+    "pyyaml",
 ]
 
 [tool.setuptools.packages.find]
