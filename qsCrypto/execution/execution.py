@@ -2,13 +2,17 @@ from __future__ import print_function
 
 from abc import ABCMeta, abstractmethod
 from decimal import Decimal, ROUND_DOWN
+import json
 import logging
+import threading
+import time
 
 from qsCrypto.event.event import FillEvent
 import math
 import os
 
 from dotenv import load_dotenv
+import websocket
 
 
 class ExecutionHandler(object):
@@ -87,11 +91,14 @@ def create_execution_handler(test_mode=True, market_type="usdm_futures",
     api_key, secret_key = load_api_credentials(test_mode)
     env_label = "testnet" if test_mode else "production"
     base_url = settings.BINANCE_ENVIRONMENTS[market_type]["api"][env_label]
+    ws_base_url = settings.BINANCE_ENVIRONMENTS[market_type]["streaming"][env_label]
     return BinancePerpetualExecutionHandler(
         api_key=api_key,
         secret_key=secret_key,
         base_url=base_url,
         market_type=market_type,
+        events_queue=kwargs.get("events_queue"),
+        ws_base_url=ws_base_url,
     )
 
 
@@ -101,14 +108,28 @@ class BinancePerpetualExecutionHandler(ExecutionHandler):
     perpetual futures via the official binance-futures-connector.
     """
 
-    def __init__(self, api_key, secret_key, base_url, market_type="usdm_futures"):
+    _LISTEN_KEY_KEEPALIVE_S = 30 * 60  # Binance expires it after 60 min idle
+
+    def __init__(self, api_key, secret_key, base_url, market_type="usdm_futures",
+                 events_queue=None, ws_base_url=None):
         self.api_key = api_key
         self.secret_key = secret_key
         self.base_url = base_url
+        self.ws_base_url = ws_base_url
         self.market_type = market_type
+        self.events_queue = events_queue
         self.logger = logging.getLogger(__name__)
         self.client = self._create_client()
         self._exchange_info = None  # lazy-loaded cache
+        self._leverage_brackets = {}  # lazy-loaded per symbol
+        # Bracket order tracking, mirrors IBKRExecutionHandler.stops/.parents.
+        self.stops = {}   # pair -> {"orderId": ..., "qty": ...}
+        self.takes = {}   # pair -> {"orderId": ..., "qty": ...}
+        self._seen_fills = set()
+        self._user_ws = None
+        self._listen_key = None
+        self._keepalive_thread = None
+        self._running_user_stream = False
 
     # ── Client creation ───────────────────────────────────────────
 
@@ -219,14 +240,27 @@ class BinancePerpetualExecutionHandler(ExecutionHandler):
 
     def execute_order(self, event):
         """
-        Execute an OrderEvent as a market order on Binance Futures.
-        Applies proper precision rounding before submission.
+        Execute an OrderEvent as a market order on Binance Futures, then
+        place STOP_MARKET/TAKE_PROFIT_MARKET bracket children when the
+        event carries stop_price/take_price (set by
+        BinancePerpetualsPortfolio.execute_signal) — the analog of
+        IBKRExecutionHandler's native bracket, adapted to Binance's lack of
+        a single linked-bracket call: the parent is placed and its fill
+        confirmed via the REST response, then the children are placed
+        reduceOnly immediately after. On liquid perpetuals this leaves only
+        a sub-second unprotected window, which reconcile_from_broker()
+        detects (missing bracket after a restart) rather than fully
+        eliminating — there is no atomic alternative on this API.
         """
         symbol = event.instrument.upper()
         side_map = {"buy": "BUY", "sell": "SELL"}
         side = side_map.get(event.side, event.side.upper())
+        opposite = "SELL" if side == "BUY" else "BUY"
 
         rounded_qty = self.round_quantity(symbol, event.units)
+        if rounded_qty <= 0:
+            self.logger.warning("Orden de %s con qty=0: no se envía.", symbol)
+            return None
 
         self.logger.info(
             "Executing %s %s | qty=%s (raw %s)",
@@ -241,10 +275,58 @@ class BinancePerpetualExecutionHandler(ExecutionHandler):
                 quantity=rounded_qty,
             )
             self.logger.info("Order response: %s", response)
-            return response
         except Exception as e:
             self.logger.error("Order failed for %s: %s", symbol, e)
             raise
+
+        stop_px = getattr(event, "stop_price", None)
+        take_px = getattr(event, "take_price", None)
+        is_add = bool(getattr(event, "is_add", False))
+
+        if stop_px is not None:
+            self._place_bracket_child(symbol, opposite, rounded_qty, stop_px,
+                                       "STOP_MARKET", is_add)
+        if take_px is not None:
+            self._place_bracket_child(symbol, opposite, rounded_qty, take_px,
+                                       "TAKE_PROFIT_MARKET", is_add)
+
+        return response
+
+    def _place_bracket_child(self, symbol, side, qty, trigger_price, order_type, is_add):
+        """Place (or, on an add, replace) a reduceOnly STOP_MARKET/
+        TAKE_PROFIT_MARKET child. Tracks it in self.stops/self.takes so
+        modify_stop/modify_take and flatten() know what to cancel."""
+        tracker = self.stops if order_type == "STOP_MARKET" else self.takes
+        rounded_price = self.round_price(symbol, trigger_price)
+
+        if is_add and symbol in tracker:
+            # Adds cancel-and-replace: Binance has no in-place amend.
+            try:
+                self.client.cancel_order(symbol=symbol, orderId=tracker[symbol]["orderId"])
+            except Exception as exc:
+                self.logger.warning("Cancelar %s previo de %s falló (¿ya no vivo?): %s",
+                                     order_type, symbol, exc)
+
+        try:
+            resp = self.client.new_order(
+                symbol=symbol,
+                side=side,
+                type=order_type,
+                stopPrice=rounded_price,
+                closePosition=False,
+                quantity=qty,
+                reduceOnly=True,
+                workingType="MARK_PRICE",
+            )
+            tracker[symbol] = {"orderId": resp["orderId"], "qty": qty}
+            self.logger.info("%s %s reduceOnly qty=%s @ %s colocado (orderId=%s)",
+                              order_type, symbol, qty, rounded_price, resp["orderId"])
+        except Exception as exc:
+            self.logger.error(
+                "CRÍTICO: no se pudo colocar %s para %s @ %s: %s — la "
+                "posición puede haber quedado sin esa barrera. "
+                "reconcile_from_broker() debe detectarlo en el próximo "
+                "arranque.", order_type, symbol, rounded_price, exc)
 
     def execute_market_order(self, symbol, side, quantity):
         """
@@ -313,6 +395,201 @@ class BinancePerpetualExecutionHandler(ExecutionHandler):
         if symbol:
             return self.client.get_open_orders(symbol=symbol.upper())
         return self.client.get_open_orders()
+
+    def get_leverage_brackets(self, symbol):
+        """Cached tiered margin brackets for `symbol`
+        (GET /fapi/v1/leverageBracket), used by
+        BinancePerpetualsPortfolio._fits_leverage() on top of the flat
+        max_gross_lev cap — no IBKR analog, CME margin has no notion of a
+        leverage-tier schedule in this codebase."""
+        symbol = symbol.upper()
+        if symbol not in self._leverage_brackets:
+            resp = self.client.leverage_brackets(symbol=symbol)
+            # Response shape: a list with one {"symbol":..., "brackets":[...]}
+            entry = resp[0] if isinstance(resp, list) else resp
+            self._leverage_brackets[symbol] = entry.get("brackets", [])
+        return self._leverage_brackets[symbol]
+
+    # ── bracket maintenance (stop/take modify, flatten) ─────────────────────
+
+    def modify_stop(self, pair, new_stop, total_qty):
+        """Cancel + re-place the resting STOP_MARKET at the new price/qty —
+        Binance has no in-place order amend, unlike IBKR where moving
+        auxPrice/totalQuantity on the live order object is enough. Needed
+        for the Turtle-style unit-adding ladder, where the aggregate stop
+        moves as units are added."""
+        pair = pair.upper()
+        return self._replace_bracket(pair, "stop", new_stop, total_qty)
+
+    def modify_take(self, pair, new_take, total_qty):
+        pair = pair.upper()
+        return self._replace_bracket(pair, "take", new_take, total_qty)
+
+    def _replace_bracket(self, pair, which, new_price, total_qty):
+        tracker = self.stops if which == "stop" else self.takes
+        order_type = "STOP_MARKET" if which == "stop" else "TAKE_PROFIT_MARKET"
+        existing = tracker.get(pair)
+        if existing is None:
+            self.logger.warning("Sin %s vivo para %s: nada que reanclar.",
+                                 order_type, pair)
+            return None
+        try:
+            self.client.cancel_order(symbol=pair, orderId=existing["orderId"])
+        except Exception as exc:
+            self.logger.warning("Cancelar %s de %s falló (¿ya no vivo?): %s",
+                                 order_type, pair, exc)
+
+        pos = self.get_position_info(pair)
+        pos = pos[0] if isinstance(pos, list) and pos else pos
+        amt = float(pos.get("positionAmt", 0)) if pos else 0.0
+        side = "SELL" if amt > 0 else "BUY"
+
+        rounded_qty = self.round_quantity(pair, total_qty)
+        rounded_price = self.round_price(pair, new_price)
+        try:
+            resp = self.client.new_order(
+                symbol=pair, side=side, type=order_type,
+                stopPrice=rounded_price, closePosition=False,
+                quantity=rounded_qty, reduceOnly=True,
+                workingType="MARK_PRICE",
+            )
+            tracker[pair] = {"orderId": resp["orderId"], "qty": rounded_qty}
+            self.logger.info("%s de %s reanclado a %s por %s (orderId=%s)",
+                              order_type, pair, rounded_price, rounded_qty,
+                              resp["orderId"])
+            return resp
+        except Exception as exc:
+            self.logger.error(
+                "CRÍTICO: reanclar %s de %s falló: %s — la posición puede "
+                "haber quedado sin esa barrera.", order_type, pair, exc)
+            return None
+
+    def flatten(self, pair, reason="manual"):
+        """Cancel all open orders first, then market-close any residual
+        position — cancel-before-flatten, same ordering as
+        IBKRExecutionHandler.flatten(): a still-live stop could otherwise
+        reopen a position right after the flatten."""
+        pair = pair.upper()
+        try:
+            self.cancel_all_orders(pair)
+        except Exception as exc:
+            self.logger.warning("cancel_all_orders(%s) falló: %s", pair, exc)
+        self.stops.pop(pair, None)
+        self.takes.pop(pair, None)
+
+        pos = self.get_position_info(pair)
+        pos = pos[0] if isinstance(pos, list) and pos else pos
+        amt = float(pos.get("positionAmt", 0)) if pos else 0.0
+        if amt == 0:
+            return 0
+
+        side = "SELL" if amt > 0 else "BUY"
+        qty = self.round_quantity(pair, abs(amt))
+        try:
+            self.client.new_order(
+                symbol=pair, side=side, type="MARKET",
+                quantity=qty, reduceOnly=True,
+            )
+            self.logger.info("Aplanando %+g de %s (%s)", amt, pair, reason)
+            return amt
+        except Exception as exc:
+            self.logger.error("Aplanar %s falló: %s", pair, exc)
+            return 0
+
+    # ── user-data-stream fill bridge ────────────────────────────────────────
+
+    def start_user_data_stream(self):
+        """Open the Binance user-data-stream websocket and start the
+        listenKey keepalive loop. This is the direct analog of
+        IBKRExecutionHandler's `self.ib.execDetailsEvent +=
+        self._on_exec_details` — with no IBKR equivalent for the keepalive
+        itself, since ib_async's session handles that transparently."""
+        if self.events_queue is None:
+            self.logger.warning(
+                "start_user_data_stream() llamado sin events_queue: los "
+                "FillEvent no tendrían adónde ir. No se conecta.")
+            return
+        self._listen_key = self.client.new_listen_key()["listenKey"]
+        self._running_user_stream = True
+        self._keepalive_thread = threading.Thread(
+            target=self._listen_key_keepalive_loop, daemon=True)
+        self._keepalive_thread.start()
+
+        url = f"{self.ws_base_url}/ws/{self._listen_key}"
+        self.logger.info("Conectando user-data-stream: %s", url)
+        self._user_ws = websocket.WebSocketApp(
+            url, on_message=self._on_user_data_message,
+            on_error=lambda ws, err: self.logger.error("user-data-stream error: %s", err),
+            on_close=lambda ws, code, msg: self.logger.info(
+                "user-data-stream cerrado: %s %s", code, msg),
+        )
+        self._user_ws.run_forever(ping_interval=180, ping_timeout=10)
+
+    def _listen_key_keepalive_loop(self):
+        while self._running_user_stream:
+            time.sleep(self._LISTEN_KEY_KEEPALIVE_S)
+            if not self._running_user_stream:
+                return
+            try:
+                self.client.renew_listen_key(listenKey=self._listen_key)
+            except Exception as exc:
+                self.logger.error(
+                    "CRÍTICO: renovar listenKey falló: %s — el "
+                    "user-data-stream expirará y los FillEvent dejarán de "
+                    "llegar hasta el próximo reinicio.", exc)
+
+    def stop_user_data_stream(self):
+        self._running_user_stream = False
+        if self._user_ws is not None:
+            try:
+                self._user_ws.close()
+            except Exception as exc:
+                self.logger.error("Error cerrando user-data-stream: %s", exc)
+        if self._listen_key is not None:
+            try:
+                self.client.close_listen_key(listenKey=self._listen_key)
+            except Exception as exc:
+                self.logger.warning("Cerrar listenKey falló: %s", exc)
+
+    def _on_user_data_message(self, ws, message):
+        try:
+            msg = json.loads(message)
+            etype = msg.get("e")
+
+            if etype == "ORDER_TRADE_UPDATE":
+                o = msg["o"]
+                if o.get("X") != "FILLED":
+                    return  # PARTIALLY_FILLED treated as informational-only
+                dedupe_key = (o["i"], o.get("T"))
+                if dedupe_key in self._seen_fills:
+                    return
+                self._seen_fills.add(dedupe_key)
+
+                fill = FillEvent(
+                    instrument=o["s"],
+                    units=float(o["z"]),          # cumulative filled qty
+                    side=o["S"].lower(),
+                    fill_price=float(o["ap"]),
+                    commission=float(o.get("n", 0.0)),
+                    time=o.get("T"),
+                    order_id=o.get("i"),
+                    is_add=False,
+                )
+                self.events_queue.put(fill)
+                self.logger.info("FILL %s %s qty=%s @ %s", fill.side,
+                                  fill.instrument, fill.units, fill.fill_price)
+
+            elif etype == "ACCOUNT_UPDATE":
+                reason = msg.get("a", {}).get("m")
+                if reason == "FUNDING_FEE":
+                    self.logger.info(
+                        "ACCOUNT_UPDATE por funding: %s — el pago exacto se "
+                        "confirma con GET /fapi/v1/fundingRate; el llamador "
+                        "es responsable de invocar "
+                        "BinancePerpetualsPortfolio.apply_funding().",
+                        msg.get("a"))
+        except Exception as exc:
+            self.logger.error("Error procesando user-data-stream: %s", exc)
 
 
 class IBKRExecutionHandler(ExecutionHandler):
