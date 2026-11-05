@@ -283,12 +283,18 @@ class IBKRFuturesPortfolio(Portfolio):
                  max_units=4, max_hold_bars=10, tp_mode="mid_channel",
                  take_n=5.0, max_gross_lev=4.0, max_dir_units=12,
                  max_corr_units=6, corr_groups=None, use_dd_rule=True,
-                 execution=None, strategy=None):
+                 execution=None, strategy=None, max_order_notional=None):
         super(IBKRFuturesPortfolio, self).__init__(
             ticker, events, home_currency=home_currency, leverage=leverage,
             equity=equity, risk_per_trade=risk_per_trade, backtest=backtest
         )
         self.specs = specs or {}
+        # Tope de nocional por ORDEN (entrada o add), en la divisa de la
+        # cuenta. Con divisas el sizing por riesgo sale enorme: N de EUR.USD a
+        # 30 min ≈ 0,0007, así que el 1% de 350k da ~4,9M EUR por unidad
+        # (~16x la equity). None = sin tope, el comportamiento anterior.
+        self.max_order_notional = (None if max_order_notional is None
+                                   else float(max_order_notional))
         self.stop_n = float(stop_n)
         self.add_n = float(add_n)
         self.max_units = int(max_units)
@@ -579,7 +585,8 @@ class IBKRFuturesPortfolio(Portfolio):
         return max(adj, eq0 * 0.05)
 
     def calc_risk_position_size(self, currency_pair, n=None):
-        """Contratos ENTEROS cuyo movimiento de 1R cuesta `risk_per_trade`.
+        """Contratos ENTEROS cuyo movimiento de 1R cuesta `risk_per_trade`,
+        recortados a `max_order_notional` si hay tope.
 
         `floor`, nunca `round`: redondear hacia arriba excedería en silencio el
         riesgo declarado. Si no cabe ni un contrato la señal se rechaza — media
@@ -591,7 +598,32 @@ class IBKRFuturesPortfolio(Portfolio):
         denom = self.stop_n * float(n) * mult
         if denom <= 0:
             return 0
-        return int(math.floor(float(self.risk_per_trade) * self.sizing_equity() / denom))
+        units = int(math.floor(float(self.risk_per_trade) * self.sizing_equity() / denom))
+        if self.max_order_notional is not None and units > 0:
+            px = self._mid_price(currency_pair)
+            if px is None or px <= 0:
+                # Sin precio no se puede aplicar el tope: se rechaza en vez de
+                # devolver el tamaño sin recortar (4,9M EUR en EUR.USD).
+                self.logger.warning(
+                    "%s: sin precio para aplicar max_order_notional; qty=0.",
+                    currency_pair)
+                return 0
+            cap = int(math.floor(self.max_order_notional / (px * mult)))
+            if cap < units:
+                self.logger.info(
+                    "%s: unidad recortada por max_order_notional %s: %d -> %d "
+                    "(el riesgo por R baja en la misma proporción).",
+                    currency_pair, self.max_order_notional, units, cap)
+                units = cap
+        return units
+
+    def _mid_price(self, pair):
+        p = self.ticker.prices.get(pair, {})
+        bid, ask = p.get("bid"), p.get("ask")
+        if bid is None or ask is None:
+            return None
+        mid = (float(bid) + float(ask)) / 2.0
+        return mid if mid == mid else None
 
     def _fits_leverage(self, pair, qty, price):
         gross = sum(

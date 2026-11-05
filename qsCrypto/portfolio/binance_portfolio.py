@@ -33,6 +33,21 @@ class BinancePerpetualsPortfolio(Portfolio):
        already exchange-VWAP-averaged, so there is no need for IBKR's
        `_vwap_from_executions` walk over the day's fills.
 
+    6. **Salida por reloj de sesión.** `session_flat_at` (p. ej. `"15:45"` en
+       `session_tz`) cierra la posición en la última vela de la sesión. Sin
+       ella las únicas salidas son stop, objetivo y barrera vertical — y
+       `max_hold_bars` cuenta barras, no horas, así que una estrategia
+       intradía que promete no tener posición overnight no puede apoyarse en
+       él. `None` (por defecto) deja intacto el camino de la estrategia de
+       reversión.
+    7. **Unidad de riesgo separada de la orden de stop.** `stop_n` dimensiona
+       (1R = stop_n*N); `stop_n_order` dice dónde se coloca el stop en el
+       exchange, y por defecto coinciden. Es el mismo desdoblamiento que
+       `stop_n`/`mae_stop_n` en el motor de backtest, y existe para las
+       estrategias cuyo backtest no lleva stop: allí el stop en vivo es solo
+       una red de seguridad, y si además dimensionara haría la posición
+       varias veces más pequeña que la validada.
+
     Safety note (explicit user instruction for the testnet/live validation
     phase, not a permanent default): pass `max_order_notional` to cap every
     order at a fixed USDT notional, and `max_units=1` to disable pyramiding
@@ -47,13 +62,27 @@ class BinancePerpetualsPortfolio(Portfolio):
                  max_units=4, max_hold_bars=10, tp_mode="mid_channel",
                  take_n=5.0, max_gross_lev=4.0, max_dir_units=12,
                  max_corr_units=6, corr_groups=None, use_dd_rule=True,
-                 execution=None, strategy=None, max_order_notional=None):
+                 execution=None, strategy=None, max_order_notional=None,
+                 stop_n_order=None, session_flat_at=None,
+                 session_open="09:30", session_tz="America/New_York"):
         super(BinancePerpetualsPortfolio, self).__init__(
             ticker, events, home_currency=home_currency, leverage=leverage,
             equity=equity, risk_per_trade=risk_per_trade, backtest=backtest
         )
         self.specs = specs or {}
+        # `stop_n` fija la UNIDAD DE RIESGO: es lo que dimensiona la posición
+        # (1R = stop_n*N) y lo que normaliza la R del diario.
         self.stop_n = float(stop_n)
+        # `stop_n_order` fija DÓNDE se pone el stop en el exchange. Por defecto
+        # coincide con `stop_n` (el comportamiento de siempre). Separarlos es
+        # lo mismo que hace `mae_stop_n` en el motor de backtest, y hace falta
+        # para una estrategia cuyo backtest NO lleva stop: ahí el stop en vivo
+        # es una red de seguridad operativa, deliberadamente ancha, y si
+        # además dimensionara la posición la haría varias veces más pequeña
+        # que la validada — el backtest y la operación dejarían de ser lo
+        # mismo sin que nada lo avisara.
+        self.stop_n_order = (float(stop_n_order) if stop_n_order is not None
+                             else float(stop_n))
         self.add_n = float(add_n)
         self.max_units = int(max_units)
         self.max_hold_bars = int(max_hold_bars)
@@ -67,6 +96,16 @@ class BinancePerpetualsPortfolio(Portfolio):
         self.execution = execution
         self.strategy = strategy
         self.equity0 = Decimal(str(equity))
+        # Cierre por reloj de sesión, p. ej. "15:45" en `session_tz`. None
+        # (por defecto) deja el comportamiento de siempre: las únicas salidas
+        # son stop, objetivo y barrera vertical. Una estrategia intradía que
+        # promete no tener posición overnight NECESITA esto: sin ello nada
+        # cierra la posición al final de la sesión, y `max_hold_bars` es un
+        # contador de barras, no un reloj — con un hueco de datos o una
+        # reconexión deja de coincidir con la hora.
+        self.session_flat_at = session_flat_at
+        self.session_open = session_open
+        self.session_tz = session_tz
         # Hard per-order notional cap. None (default) leaves sizing
         # unconstrained beyond risk/leverage; the testnet validation phase
         # must pass an explicit USDT value here (see class docstring).
@@ -238,7 +277,7 @@ class BinancePerpetualsPortfolio(Portfolio):
             self.logger.warning("Apalancamiento: %s qty=%s rechazado.", pair, qty)
             return
 
-        stop_px = float(px) - side * self.stop_n * float(n)
+        stop_px = float(px) - side * self.stop_n_order * float(n)
         take_px = None
         if self.tp_mode == "mid_channel" and signal_event.mid is not None:
             take_px = float(signal_event.mid)
@@ -274,6 +313,41 @@ class BinancePerpetualsPortfolio(Portfolio):
         return None if not px.is_finite() else px
 
     # ── bars: fallback barrier checks + vertical exit + pyramiding ─────────
+    def _past_session_close(self, ts):
+        """¿Esta barra deja la posición FUERA de la sesión?
+
+        `ts` es la hora de APERTURA de la vela (así las publica Binance y así
+        las reenvía BinanceKlinePriceHandler), así que la vela que abre a las
+        15:40 es la que cierra a las 15:45: se compara la apertura con el
+        cierre de sesión menos una vela. `bar_seconds` sale del handler para
+        no duplicar aquí el tamaño de la vela.
+
+        Se comprueban los DOS bordes, no solo el cierre. Con solo el cierre,
+        una posición que de algún modo sobreviviera a la medianoche no se
+        cerraría hasta las 15:40 del día siguiente: a partir de las 00:00 la
+        hora local vuelve a ser "antes del cierre" y la comprobación diría que
+        todo va bien. Mirando también la apertura, cualquier barra fuera de
+        [apertura, cierre) aplana — que es lo que "sin posición overnight"
+        quiere decir.
+        """
+        if self.session_flat_at is None or ts is None:
+            return False
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+        import pandas as pd
+
+        bar_secs = getattr(self.ticker, "_INTERVAL_SECONDS", {}).get(
+            getattr(self.ticker, "interval", None), 300)
+        loc = (pd.Timestamp(ts).tz_localize(timezone.utc)
+               .tz_convert(ZoneInfo(self.session_tz)))
+        day = loc.normalize()
+        ch, cm = (int(x) for x in self.session_flat_at.split(":"))
+        close_local = day + pd.Timedelta(hours=ch, minutes=cm)
+        oh, om = (int(x) for x in self.session_open.split(":"))
+        open_local = day + pd.Timedelta(hours=oh, minutes=om)
+        return loc >= close_local - pd.Timedelta(seconds=bar_secs) \
+            or loc < open_local
+
     def on_bar(self, bar_event):
         """Vertical time-barrier exit and Turtle unit-adding, evaluated on
         closed bars. Stop/target are broker-managed orders (see class
@@ -289,6 +363,17 @@ class BinancePerpetualsPortfolio(Portfolio):
             return
         m = self.meta[pair]
         m["bars"] += 1
+
+        # El reloj manda sobre todo lo demás. Va ANTES de las comprobaciones
+        # de stop/objetivo a propósito: si la barra del cierre de sesión
+        # además cruzó el stop, la posición se cierra igual en vez de quedarse
+        # esperando un FillEvent del broker que quizá no llegue, que es
+        # justamente la posición overnight que la estrategia promete no tener.
+        if self._past_session_close(bar_event.time):
+            self.logger.info("%s: cierre de sesión (%s %s) — aplanando",
+                             pair, self.session_flat_at, self.session_tz)
+            self._exit(pair, float(bar_event.close), "cierre_sesion")
+            return
         side, sd = m["side"], float(m["side"])
         hi, lo = float(bar_event.high), float(bar_event.low)
         flat = hi <= lo and (bar_event.volume or 0) <= 0
@@ -342,7 +427,7 @@ class BinancePerpetualsPortfolio(Portfolio):
             return
         order = OrderEvent(pair, qty, "market", "buy" if side > 0 else "sell")
         order.is_add = True
-        order.stop_price = fill_ref - sd * self.stop_n * m["n"]
+        order.stop_price = fill_ref - sd * self.stop_n_order * m["n"]
         order.take_price = m.get("take")
         self.events.put(order)
         self.logger.info("ADD %s unidad %d en %.6f", pair, m["units"] + 1, fill_ref)
@@ -404,7 +489,7 @@ class BinancePerpetualsPortfolio(Portfolio):
             m["last_fill"] = vwap
             ps.add_units(Decimal(str(fill_event.units)))
             ps.reanchor_entry(Decimal(str(vwap)))
-            m["stop"] = vwap - sd * self.stop_n * m["n"]
+            m["stop"] = vwap - sd * self.stop_n_order * m["n"]
             if self.execution is not None:
                 self.execution.modify_stop(pair, m["stop"], m["qty"])
         else:
@@ -412,7 +497,7 @@ class BinancePerpetualsPortfolio(Portfolio):
             m["qty"] = float(fill_event.units)
             ps.units = Decimal(str(fill_event.units))
             ps.reanchor_entry(Decimal(str(vwap)))
-            m["stop"] = vwap - sd * self.stop_n * m["n"]
+            m["stop"] = vwap - sd * self.stop_n_order * m["n"]
         self._emit_state("fill")
 
     # ── funding (no IBKR analog — perpetuals only) ──────────────────────────

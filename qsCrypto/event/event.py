@@ -76,9 +76,14 @@ class BarEvent(Event):
     bid/ask no lo lleva. Se emite solo con la barra terminada: una barra en curso
     tiene máximo y mínimo provisionales, y actuar sobre ella adelanta la señal a
     información que aún no está completa.
+
+    `backfill=True` marca una barra cerrada que llega TARDE, en ráfaga, detrás
+    de otra más reciente (p. ej. tras reabrir la suscripción de IBKR). Es
+    historia legítima para N y el canal, pero ya no es operable: una señal
+    sobre ella se ejecutaría a precio de ahora con información de antes.
     """
     def __init__(self, instrument, time, open_, high, low, close,
-                 volume=0.0, complete=True):
+                 volume=0.0, complete=True, backfill=False):
         self.type = 'BAR'
         self.instrument = instrument
         self.time = time
@@ -88,12 +93,14 @@ class BarEvent(Event):
         self.close = close
         self.volume = volume
         self.complete = complete
+        self.backfill = backfill
 
     def __str__(self):
         return (
-            "Type: %s, Instrument: %s, Time: %s, O: %s, H: %s, L: %s, C: %s" % (
+            "Type: %s, Instrument: %s, Time: %s, O: %s, H: %s, L: %s, C: %s%s" % (
                 str(self.type), str(self.instrument), str(self.time),
-                str(self.open), str(self.high), str(self.low), str(self.close)
+                str(self.open), str(self.high), str(self.low), str(self.close),
+                " (backfill)" if self.backfill else ""
             )
         )
 

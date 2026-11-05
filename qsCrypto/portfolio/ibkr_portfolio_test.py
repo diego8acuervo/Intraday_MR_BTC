@@ -54,6 +54,20 @@ class TestSizing(unittest.TestCase):
         self.assertEqual(p1.calc_risk_position_size("MBT", n=500.0), 20)
         self.assertEqual(p2.calc_risk_position_size("MBT", n=500.0), 10)
 
+    def test_max_order_notional_caps_the_unit(self):
+        """20 contratos x 100.000 x 0,1 = 200.000 de nocional; con tope de
+        30.000 caben floor(30.000 / 10.000) = 3."""
+        p, _, _ = make(stop_n=1.0, max_order_notional=30_000)
+        self.assertEqual(p.calc_risk_position_size("MBT", n=500.0), 3)
+        p2, _, _ = make(stop_n=1.0, max_order_notional=1e9)
+        self.assertEqual(p2.calc_risk_position_size("MBT", n=500.0), 20)
+
+    def test_max_order_notional_without_price_refuses(self):
+        """Sin precio el tope no se puede aplicar: 0, nunca el tamaño entero."""
+        p, _, t = make(stop_n=1.0, max_order_notional=30_000)
+        t.prices["MBT"] = {"bid": None, "ask": None, "time": None}
+        self.assertEqual(p.calc_risk_position_size("MBT", n=500.0), 0)
+
     def test_multiplier_is_applied(self):
         """Sin multiplicador, MBT (0.1 BTC) daría 10x el tamaño correcto."""
         p, _, _ = make(stop_n=1.0)

@@ -852,3 +852,422 @@ dependen de la selección: la aritmética de la escalera, el desplome del ganado
 el stop, la falta de poder del `MAE*` como criterio, el E-ratio < 1 y la fragilidad de muestra.
 Todas se miden sobre cientos de trades dentro de una configuración, no eligiendo entre
 configuraciones.
+
+---
+
+## 11. Binance perpetuo vs. CME MBT: el coste no explica la diferencia
+
+> Cifras de `qsCrypto/notebooks/MeanReversion_Binance_Perp.ipynb` §12, sobre la **rejilla
+> idéntica** de 4.354 barras de 30 min (los timestamps de CME intersecados contra BTCUSDT,
+> 2025-04-25 → 2026-09-04). Mismo sistema, mismos parámetros, mismas barras. La comparación
+> contra los 277 trades reales de `output/turtle_ibkr_MBT_30mins_trades.csv`.
+
+**Hipótesis puesta a prueba:** *la diferencia de desempeño se explica en su totalidad por
+mayores costes.* **Rechazada por los datos: el coste explica el 22 %.**
+
+### 11.1 La tarifa, por lado y por unidad de nocional
+
+El coste del CME es **fijo por contrato** (0,62 USD comisión + 1 tick de 0,50 USD) y el de
+Binance es **proporcional al nocional** (2 pb taker + 1 pb de deslizamiento). Para compararlos
+hay que expresar el fijo en pb, dividiendo por el nocional real de un contrato MBT
+(`entry × 0,1`, media de 8.770 USD en los 277 trades):
+
+| | Comisión / lado | Deslizamiento / lado | Total / lado | **Round-trip** |
+|---|---|---|---|---|
+| **CME MBT (IBKR)** | 0,62 USD = **0,746 pb** | 0,50 USD = **0,601 pb** | 1,347 pb | **2,69 pb** |
+| **Binance BTCUSDT perp** | **2,000 pb** | **1,000 pb** | 3,000 pb | **6,00 pb** |
+| | | | | **2,23× más caro** |
+
+### 11.2 Lo que eso cuesta con una cuenta de 100.000
+
+El sizing es el mismo en los dos casos (`qty = 1 % × equity / (1N)`), y **N/precio es
+prácticamente idéntico** en las dos series sobre la misma rejilla —BTCUSDT 0,6725 %, MBT
+0,6688 %—, así que una unidad tiene el mismo nocional en ambos y la diferencia es **enteramente
+la tarifa**, no el tamaño:
+
+| Con 100.000 y riesgo 1 % | Binance BTCUSDT | CME MBT |
+|---|---|---|
+| Nocional de 1 unidad | 148.689 USD | 149.532 USD |
+| Coste round-trip, 1 unidad | **89,21 USD = 0,089 R** | **40,28 USD = 0,040 R** |
+| Coste round-trip, 2 unidades (riesgo 1,5 R) | **178,43 USD = 0,119 R** | **80,57 USD = 0,054 R** |
+
+Medido sobre los trades reales, con la escalera cargada de verdad (1,72 unidades medias en
+Binance, 1,76 en CME) y cobrando cada add:
+
+| Por trade, medido | Binance | CME MBT |
+|---|---|---|
+| Coste medio | **95,03 USD** | **63,31 USD** |
+| Coste en R inicial | **0,140 R** | **0,065 R** |
+| Trades | 302 | 277 |
+| **Drag total de la fricción** | **42,2 R** | **18,1 R** |
+| Coste facturado en la ventana | **28.698 USD** | **17.537 USD** |
+| Turnover (suma de nocional ejecutado) | 102,5 M USD | 131,5 M USD |
+
+El CME **mueve un 28 % más de nocional y paga un 39 % menos**. Es toda la aritmética del coste
+fijo: a 8.770 USD por contrato, 1,12 USD por lado son 1,35 pb; en Binance son 3,00 pb sin
+importar el tamaño.
+
+**Funding: irrelevante.** 1.494 liquidaciones en la ventana suman **−199 USD**, un −0,15 %/año
+sobre el capital inicial. Era la sospecha inicial y no es el mecanismo.
+
+### 11.3 El contrafactual que rechaza la hipótesis
+
+Mismas barras, mismas señales, mismos trades (302 en los cuatro casos: la tarifa no cambia
+*qué* se opera, solo cuánto queda):
+
+| Escenario, rejilla CME de 4.354 barras | P&L | CAGR | mean R | win |
+|---|---|---|---|---|
+| Binance, tarifa real (2+1 pb) + funding real | **−10.611** | **−7,91 %** | +0,012 | 29,5 % |
+| Binance, tarifa real, sin funding | −10.944 | −8,17 % | +0,014 | 29,5 % |
+| **Binance con la tarifa del CME MBT (0,75+0,60 pb)** | **+12.946** | **+9,36 %** | +0,091 | 30,1 % |
+| Binance, sin costes ni funding | **+47.542** | **+33,09 %** | +0,167 | 31,1 % |
+| **CME MBT, real, con sus costes** | **+97.877** | **+63,22 %** | — | 36,1 % |
+
+**Lo que cierra la hipótesis:** poner a Binance la tarifa exacta del CME recupera 23.557 USD.
+La distancia total a CME es de 108.488 USD. **El coste explica el 21,7 %; el 78 % restante
+sobrevive a igualar la tarifa.** Y el techo del argumento es todavía más claro: **regalando por
+completo la operativa** —cero comisión, cero deslizamiento, cero funding— Binance rinde
++33,09 % frente al +63,22 % que CME obtiene *pagando* sus costes. El coste no puede explicar una
+diferencia que persiste cuando el coste es cero.
+
+### 11.4 El coste sí importa — pero por otra vía
+
+Lo que sí muestran los datos es que **la fricción se amplifica** al pasar por el sizing. Cobrar
+15.100 USD de coste (tarifa CME) destruye 34.596 USD de P&L: **2,3× lo facturado**. Cobrar
+28.698 USD (tarifa Binance) destruye 58.153 USD: **2,0×**. El motivo es mecánico y ya está en
+§7: `qty` se calcula sobre el `balance` vivo y la regla de drawdown recorta el nocional otro
+20 % por cada −10 % de equity. Cada dólar de coste no se resta una vez; se resta y además
+encoge todas las posiciones siguientes.
+
+Por eso, con un edge desnudo de **+0,167 R** por trade, una fricción de **0,140 R** no deja
+margen: **se lleva el 84 % de la esperanza**. Con la tarifa del CME se lleva el 39 %. Ése es el
+número que decide si esta estrategia es operable en un perpetuo, y no depende de nada que se
+pueda ajustar en el código.
+
+### 11.5 Qué queda sin explicar, y qué ya estaba medido
+
+El 78 % de la diferencia que no es coste no se atribuye aquí a nada nuevo. Dos efectos ya
+medidos en este documento y en los notebooks apuntan en la dirección correcta, y **ninguno de
+los dos favorece a la estrategia**:
+
+- **Velas planas: MBT 8,4 %, BTCUSDT 0,0 %** (§1 y notebook Binance §12.5). Una vela sin rango
+  ni volumen no puede tocar ninguna barrera horizontal, así que en el 8,4 % de las barras la
+  posición del CME es **inmune al stop**. Es un artefacto del feed, no una propiedad del
+  mercado, y **infla el resultado de CME**.
+- **Empalme de vencimientos: +14,77 % acumulado en 12 rolls, ≈ +11 %/año** (§8). La serie de
+  CME **no está retroajustada**; BTCUSDT no tiene rolls que empalmar.
+
+Cuantificar cuánto de los 84.931 USD restantes corresponde a cada uno exige rehacer el backtest
+de CME con la serie retroajustada y sin velas planas. **No se ha hecho, y hasta que se haga la
+diferencia queda como no explicada.** Lo que sí queda cerrado es que no es el coste.
+
+---
+
+## 12. Momentum del rango de apertura vs VWAP de 24 h: la tasa base es 50 %
+
+> Fuente: `qsCrypto/notebooks/Intraday_Momentum_OR_VWAP.ipynb`, ejecutado de punta a punta
+> sobre 4,7 años de velas de 5 minutos de Binance USDⓈ-M (1 225 sesiones, BTCUSDT/ETHUSDT/
+> SOLUSDT + QQQUSDT como control). Veredicto: **no desplegable — falla los 4 criterios
+> críticos** (DSR, supervivencia a costes, R de cartera > 0, significancia del WFO), con la
+> higiene de la medición pasando entera (12/12).
+
+La hipótesis: la primera vela de 5 minutos de la sesión NYSE/CME predice el color del día. Si
+es alcista y cierra por encima del VWAP de las últimas 24 h (288 velas, incluidas las
+overnight), comprar; bajista y por debajo, vender; plano a las 15:45 ET.
+
+### 12.1 El número que cierra la discusión
+
+El cierre de la sesión cae del lado de la señal:
+
+| símbolo | sesiones | acuerdo color/VWAP | señales | **acierto bruto** |
+|---|---|---|---|---|
+| BTCUSDT | 1 225 | 57,1 % | 699 | **49,8 %** |
+| ETHUSDT | 1 225 | 55,4 % | 679 | **49,9 %** |
+| SOLUSDT | 1 225 | 54,2 % | 664 | **46,8 %** |
+| QQQUSDT | 114 | 61,4 % | 70 | **48,6 %** |
+
+Esto es antes de costes, de ejecución y de sizing: es la tasa base que la estrategia afirma.
+Es una moneda al aire. Todo lo demás del cuaderno es consecuencia de esto, y **ninguna
+calibración arregla una tasa base del 50 %**.
+
+### 12.2 El control desmiente el mecanismo, no lo confirma
+
+QQQUSDT existe en este cuaderno precisamente para hacer interpretable un nulo en BTC: si la
+tesis es flujo real de la sesión de contado estadounidense, el efecto tiene que verse **más
+fuerte** en el proxy del Nasdaq. Y la señal sí es más nítida ahí — mayor cuerpo de apertura en
+N (0,099 contra 0,043 de BTC) y mayor acuerdo color/VWAP (61 % contra 57 %). Lo que no hace es
+predecir: 48,6 % de acierto, y la fricción se lleva el **99 %** del bruto (+0,043 R → +0,001 R).
+
+La señal existe más donde el mecanismo lo predice. El poder predictivo, no.
+
+### 12.3 La fricción, otra vez
+
+| símbolo | R bruto | comisiones | deslizamiento | funding | **R neto** | fricción/bruto |
+|---|---|---|---|---|---|---|
+| BTCUSDT | +0,0408 | −0,0124 | −0,0062 | −0,0001 | **+0,0221** | **46 %** |
+| ETHUSDT | +0,0187 | −0,0097 | −0,0048 | −0,0003 | **+0,0039** | **77 %** |
+| SOLUSDT | −0,0202 | −0,0067 | −0,0033 | −0,0002 | **−0,0304** | — |
+| QQQUSDT | +0,0432 | −0,0285 | −0,0143 | +0,0005 | **+0,0009** | **99 %** |
+
+Referencia: el fade Donchian 24/7 estaba en 56 %. Aquí BTC está mejor (46 %) y todo lo demás
+peor. Con **costes cero** el flagship daría +6,0 % CAGR y Sharpe 7,25; en el escenario
+*optimista* del barrido de sensibilidad (2 pb comisión + 5 pb deslizamiento) ya es **−1,1 %**.
+El único resultado positivo del cuaderno vive enteramente dentro del supuesto de 2 pb + 1 pb.
+
+### 12.4 Diversificar no ayuda: 3 símbolos son 1,4 apuestas
+
+La cartera de los tres símbolos con muestra suficiente pierde: **CAGR −2,9 %, Sharpe −1,99,
+Max DD −22 %** sobre 2 040 operaciones, aunque BTCUSDT aislado gane un 15 % en 4,7 años.
+`effective_bets` da correlación media **0,77** y **1,37 apuestas efectivas de 3 símbolos**, con
+el 100 % de los pares por encima de 0,70. No es una cartera; es la misma apuesta tres veces.
+
+### 12.5 Los estadísticos de sobreajuste, y el patrón repetido
+
+- **DSR = 0,0** con 70 ensayos: el Sharpe OOS (0,12) está muy por debajo del que produciría el
+  azar tras esa búsqueda (17,09).
+- **Walk-forward**: gana a la base en 9 de 14 folds, pero **p = 0,26**. No significativo.
+- **PBO = 0,39** y ganador modal estable al 64 %.
+
+Ese último par es el mismo patrón que `MeanReversion_Binance_Perp.ipynb`: la selección de
+parámetros **es** consistente, solo que converge de forma estable a una configuración que
+tampoco gana. Un PBO bajo dice que la optimización no se engaña a sí misma; no dice que haya
+edge que encontrar.
+
+### 12.6 Lo que sí se aprendió, y que sobrevive al veredicto
+
+**1. N tiene que medir el horizonte de la posición, no el de la vela.** Al primer intento se
+usó `compute_n(period=288)` sobre velas de 5 minutos, creyendo que daba "volatilidad de 24 h".
+No la da: es la media de Wilder del rango verdadero de **cada vela**, así que devuelve el rango
+medio de una vela de 5 minutos suavizado sobre un día — ~104 $ con BTC a 46 000 $, cuando el
+recorrido real de 24 h son ~2 055 $ y el de una sesión ~1 370 $.
+
+El síntoma fue inmediato y fácil de leer mal: **R de ±20** y la cuenta partida por la mitad
+"arriesgando el 1 %". Un recorrido de sesión son **13,6** de esas N. Dimensionar una posición
+de 6 h 15 min con volatilidad de 5 minutos infradimensiona el riesgo por ese factor.
+`rolling_range_n` (rango de las últimas 288 velas) lo corrige y además sale del mismo búfer de
+288 velas que ya necesita el ancla VWAP, así que el motor en vivo no necesita una serie diaria
+aparte. La N Turtle diaria clásica da ~2 175 $, un 6 % de diferencia: la elección concreta no
+importa, lo que importaba era el orden de magnitud.
+
+**2. Esta vez el backtest no miente.** Los dos sistemas anteriores murieron por errores de
+simulación (ceguera al stop overnight en el del VWAP). Éste es **estructuralmente inmune**: la
+posición se cierra a las 15:45 ET y nunca hay orden en reposo cruzando la noche. Se comprueba
+en vez de afirmarse — correr con y sin el camino 24/7 completo da resultados **idénticos** al
+bit. Cuando el mecanismo de la estrategia elimina una clase de error, conviene medirlo: es la
+diferencia entre "no debería pasar" y "no pasa".
+
+**3. Correr sin stop es lo que permite decidir sobre el stop.** La línea base usa
+`mae_stop_n=inf`: `stop_n` fija la unidad de riesgo (sizing y R) pero nada cierra la posición
+salvo el reloj. Con un stop real, la MAE queda truncada en el stop y la distribución ya no
+puede decir dónde ponerlo — se mediría el propio stop. Sin él: la MAE **no discrimina**
+(edge ratio 0,92, la excursión favorable ni siquiera supera a la adversa), y barrer el stop
+entre 0,25 N y 2 N no mejora nada de forma monótona. Un stop no salva a este sistema, y eso se
+sabe *porque* se corrió sin él.
+
+**4. Una lista de criterios plana deja que la higiene vote sobre el edge.** La lista de
+verificación heredada de los cuadernos anteriores pondera igual los 15-16 criterios y dispara el
+veredicto en el 70 %. Al corregir un criterio que estaba mal calculado (`pnl_concentration`
+devuelve `top_3`, no `top_3_pct`: el `.get()` daba NaN y el criterio salía False siempre) y
+añadir otro de higiene, este cuaderno pasó de 67 % a **75 %** y el veredicto se dio la vuelta a
+"desplegable" — **sin que cambiara un solo número sobre el edge**: DSR seguía en 0,0, la cartera
+seguía en Sharpe −1,99 y seguía sin sobrevivir al escenario optimista de costes.
+
+La lista se partió en dos: **críticos** (DSR, supervivencia a costes, R de cartera > 0,
+significancia del WFO) que son de **veto**, y **higiene** (look-ahead, arranque desigual,
+ceguera overnight, concentración, PBO, muestra) que hacen creíble un resultado positivo pero no
+lo producen. No tener look-ahead es condición para creerse un número positivo, no un sustituto
+de tenerlo. Los cuadernos anteriores tienen el mismo defecto en su lista; sus veredictos no
+cambian porque fallaban también en los críticos, pero el mecanismo estaba ahí.
+
+**5. Dos piezas reutilizables quedan en el motor.** `BinancePerpetualsPortfolio` gana
+`session_flat_at` (cierre por reloj de sesión, comprobando **ambos** bordes: sin el borde de
+apertura, una posición que sobreviviera a la medianoche no se cerraría hasta las 15:40 del día
+siguiente) y la separación `stop_n` / `stop_n_order` — unidad de riesgo contra dónde va la
+orden de stop, el mismo desdoblamiento que `stop_n`/`mae_stop_n` en el motor de backtest. Hace
+falta para cualquier estrategia cuyo backtest no lleve stop: en vivo el stop es una red de
+seguridad ancha, y si además dimensionara, la posición saldría varias veces más pequeña que la
+validada sin que nada lo avisara. Tests en `qsCrypto/portfolio/binance_session_test.py`.
+
+### 12.7 Qué no merece la pena, y qué sí
+
+**No merece la pena** seguir barriendo parámetros: cada barrido encarece el DSR y el problema
+no está en la calibración.
+
+Merecen la pena, como preguntas **nuevas** y no como rescate de ésta:
+
+1. **QQQUSDT con dos años de muestra.** Es donde la señal es más nítida y el único sitio donde
+   el mecanismo postulado podría verificarse. Con 115 sesiones no se puede decidir.
+2. **Volume bars o dollar bars** — muestrear por tiempo de mercado en vez de por reloj, como
+   apunta el docstring original de la estrategia. Requiere tick data de los primeros 5 minutos
+   de cada sesión.
+3. **CME MBT en lugar del perpetuo**: sin funding, y la sesión regular coincide con el
+   mecanismo postulado. Bloqueado hoy por el entitlement de datos de IBKR (10197/10089).
+
+---
+
+## 13. Muestreo por información: el nulo era de la hipótesis, no del reloj
+
+> Fuente: `qsCrypto/notebooks/Information_Bars_Opening_Range.ipynb`, ejecutado de punta a punta
+> sobre 2.471.041 velas de 1 minuto de BTCUSDT (um), 1.225 sesiones, 2022-01 → 2026-09. Once
+> esquemas de muestreo más un control. Veredicto: **ninguno cruza la puerta**.
+
+El §12 dejó abierta una pregunta legítima: si el 49,8 % de acierto de la vela de apertura era de
+la **hipótesis** o de **cómo se muestrearon los datos**. López de Prado (AFML cap. 2) sostiene lo
+segundo: la información no llega uniformemente en tiempo de reloj, así que las barras de tiempo
+sobremuestrean lo tranquilo e inframuestrean lo activo. Se probó: mismo instrumento, misma regla
+de señal (`opening_range_signal`), misma ancla, misma salida — **solo cambia el muestreo**.
+
+### 13.1 El control es lo que da valor al nulo
+
+Las velas de 5 minutos pasadas por el camino de código nuevo dan **49,79 %**, la misma cifra
+hasta la centésima que el §12. Cuando los otros once esquemas no separan del ruido, es porque no
+hay señal, no porque la tubería esté rota. Un experimento de muestreo sin este control no
+distingue "no hay efecto" de "lo he construido mal".
+
+### 13.2 Resultados
+
+n ≈ 700 señales por celda (solo ~57 % de las sesiones producen señal), error típico 1,89 %.
+Puerta pre-registrada con corrección de Bonferroni sobre 11 celdas: **55,36 %**.
+
+| esquema | min/barra | acierto | IC 95 % |
+|---|---|---|---|
+| **dollar $115M** | 5 | **52,06 %** | [48,37 ; 55,72] |
+| dollar $58M | 3 | 51,29 % | [47,58 ; 54,98] |
+| imbalance 1.200 BTC | 32 | 50,88 % | [47,53 ; 54,22] |
+| volume 2.250 BTC | 5 | 50,85 % | [47,17 ; 54,52] |
+| **volume 5.000 BTC** (la hipótesis) | 11 | **49,93 %** | [46,40 ; 53,47] |
+| *CONTROL time 5min* | 5 | *49,79 %* | [46,09 ; 53,48] |
+
+Ninguno excluye el 50 % ni **sin** corregir. Los 5.000 BTC que motivaban el experimento dan
+exactamente la moneda al aire del §12.
+
+**LdP acierta en la dirección y no le alcanza**: a igualdad de duración, las barras de dólar
+baten a las de volumen en las dos duraciones cortas (52,06 vs 50,85 a 5 min; 51,29 vs 49,64 a 3),
+que es lo que predice su argumento de invariancia al nivel de precio. Pero ~1,2 puntos con error
+típico 1,9 es ruido.
+
+### 13.3 El defecto que la hipótesis traía de fábrica, medido
+
+Un umbral fijo en BTC muestrea un trozo distinto de la sesión cada año:
+
+| año | barra de 5.000 BTC | barra de $115M |
+|---|---|---|
+| 2022 | 6 min | 5 min |
+| 2025 | **17 min** | 5 min |
+
+El volumen en BTC de la vela 09:30–09:35 cayó de 4.683 a 1.366 (−71 %) mientras el volumen en
+dólares se mantuvo plano (~$120–140 M). "Los primeros 5.000 BTC" no es la misma pregunta en 2022
+y en 2025. Es exactamente el argumento del libro a favor de las barras de dólar, medido en datos
+propios.
+
+### 13.4 Tres trampas que costó encontrar
+
+**1. Las barras de desequilibrio de la EWMA degeneran sobre velas de 1 minuto, en silencio.** La
+formulación canónica dispara cuando `|theta_T| >= E[T]·|2v⁺−E[v]|`. Pero `theta` es una suma de
+flujo **firmado**: se comporta como un paseo aleatorio y crece con `sqrt(T)`, no con `T`. Un
+disparador que escala con `E[T]` se va por encima de lo alcanzable — a 5 minutos pedía 297 BTC
+cuando el paseo aleatorio alcanza ~340 en el mejor caso — así que la barra topaba en
+`max_minutes`, `E[T]` se actualizaba hacia el tope, y el disparador subía más. Realimentación
+positiva.
+
+En la primera ejecución las tres celdas de desequilibrio daban una barra de apertura de **75
+minutos exactos —el tope— en todas las sesiones**. No eran barras de desequilibrio: eran el tope
+disfrazado, y nada en el resultado lo delataba (salían cifras plausibles, ~50 %). Se detectó
+mirando `min/barra`, no el acierto.
+
+La solución fue un **umbral fijo calibrado por duración** (300 BTC ≈ 5 min, 600 ≈ 12, 1.200 ≈ 31),
+que además es lo único que permite comparar los tres esquemas a igualdad de tamaño de barra en
+vez de comparar duraciones distintas. La EWMA se conserva en `imbalance_bars(threshold=None)` con
+la inestabilidad documentada.
+
+**2. "El color de la vela diaria" no es una predicción.** La vela diaria de Binance abre a las
+00:00 UTC; la señal se emite a las 14:35 UTC. En ese instante **ya ha ocurrido el 54 % del
+recorrido del día**, y el signo del movimiento hasta ese momento ya coincide con el de la vela
+completa el **75,1 %** de los días. Por eso la columna de "acierto diario" salía en ~75 % para
+*todos* los esquemas, **incluido el control que ya sabíamos que no predice nada**. No predice la
+vela: la observa a mitad de camino. Un 75 % que parece extraordinario y no es nada.
+
+**3. El archivo de Binance no es idéntico al REST.** `data.binance.vision` rellena algunos tramos
+con velas planas (volumen 0, precio congelado: 2023-11-10, 2024-03-27, 2024-10-28) donde el REST
+sí devuelve mercado: 308 minutos en toda la muestra, 114 dentro de sesión, 2 sesiones afectadas.
+Además hay ~3 barras donde el archivo trae ~3× el volumen del REST (la caché REST se pobló en
+vivo y capturó datos incompletos). En agregado las dos fuentes cuadran al 0,009 %.
+
+La puerta de integridad del cuaderno no afloja la tolerancia: exige que **toda** discrepancia esté
+explicada por minutos de volumen cero y acota el residuo. Un desplazamiento de columnas o un
+desfase de huso produciría discrepancias en barras *con* volumen y por todo el rango — y haría
+fallar el test aunque el error relativo fuese pequeño. Es la diferencia entre "artefacto conocido
+y acotado" y "tolerancia generosa".
+
+### 13.5 El proxy de 1 minuto no llega, y el nulo aguanta igual
+
+Contra aggTrades reales en 40 sesiones estratificadas: la frontera de barra se desplaza ~28
+segundos y el cierre ~0,009 N, pero **el signo de la señal se vuelca en el 6,7 %** de las
+sesiones — por encima del 2 % que se había fijado como aceptable. Limitación real, declarada.
+
+No cambia la conclusión, y el motivo importa: un volteo no correlacionado con el resultado es
+ruido de clasificación, y el ruido de clasificación **atenúa hacia el 50 %, nunca aleja**.
+Desatenuando (`p = (p_obs − f)/(1 − 2f)`), el mejor esquema pasa de 52,06 % a 52,37 %: sigue a
+tres puntos de la puerta. El proxy puede estar **escondiendo** señal; no puede fabricarla. Si el
+veredicto fuera positivo, este mismo fallo lo invalidaría — la asimetría es deliberada.
+
+### 13.6 Qué queda
+
+La pregunta del §12 queda cerrada: el nulo es de la **hipótesis**, no del muestreo. Es un
+resultado más fuerte que el del §12 por sí solo, que no podía descartar el reloj.
+
+No merece la pena: más umbrales (cada uno encarece la puerta), barras de tick (el esquema más
+débil de los cuatro según AFML), ni el backtest con costes — el suelo económico es lo de menos
+cuando la tasa base es 50 %.
+
+Sí podrían merecerla, como preguntas **nuevas**:
+
+1. **Desequilibrio sobre tick data de verdad.** Es el único esquema cuya versión de 1 minuto
+   pierde información de forma sustantiva: el flujo alternante *dentro* del minuto se cancela
+   antes de contarse, así que el desequilibrio medido es una cota inferior. El lector ya está
+   escrito (`fetch_aggtrades_day`); el coste son ~4 GB por cada 200 sesiones.
+2. **Otro predictor sobre estas mismas barras.** La infraestructura (`qsCrypto/backtest/bars.py`,
+   la validación contra tick data, la puerta pre-registrada) es agnóstica a la señal. Lo que se
+   agotó es el rango de apertura contra el VWAP, no el muestreo por información.
+
+### 13.7 Rentabilidad medida, y el A/B de la hora de cierre
+
+> Añadido tras la pregunta correcta: *"me interesa rentabilidad, no accuracy del predictor"*.
+> Backtest en `qsCrypto/backtest/session_backtest.py`, con costes reales, funding histórico y
+> curva de equity. A/B entre cerrar a **16:00 ET** (cierre del NYSE) y a **23:59 UTC** (fin del
+> día UTC, para que la posición nunca cruce la medianoche).
+
+**Gana 16:00 ET, en los 12 esquemas sin excepción** (diferencia mediana de Sharpe: −0,23 al
+extender). Duplicar la exposición de 6,4 h a 10,3 h **baja** el R neto medio de 0,0395 a 0,0294
+y empeora el drawdown de −8,5 % a −11,3 %. Las cuatro horas posteriores al cierre del contado
+añaden varianza sin añadir deriva. La objeción de que la vela diaria abarca 24 h era correcta
+como crítica de la métrica, pero extender la posición no la arregla: la confirma al revés — si
+queda algo, vive dentro de la sesión de contado.
+
+**El mejor sistema posible** (`dollar $115M`, salida 16:00 ET, 705 operaciones, 4,7 años) da
+CAGR +6,07 %, Sharpe 0,64, Max DD −8,5 %. Parece vivo. No lo está:
+
+| | |
+|---|---|
+| **top-10 operaciones (1,4 %)** | **97,6 % del P&L** |
+| top-5 | 63 % del P&L |
+| R neto **mediano** | +0,0049 (≈ cero) |
+| MAE mediana / R medio | **6,8x** |
+| t-stat(R) | 1,76 (puerta con 24 intentos: 3,08) |
+| CAGR con costes *optimistas* (2+5 pb) | **+2,1 %**, Sharpe 0,18 |
+| CAGR con costes *base* (5+10 pb) | **−4,5 %** |
+
+Quita diez días de 1.225 y el sistema no existe. Eso es la objeción de las velas planas
+cuantificada: la media es positiva, la operación típica no gana nada, y el riesgo soportado
+—6,8 unidades de excursión adversa mediana por unidad de R devuelta, sin stop— no está
+remunerado.
+
+**Lección de método, y es la tercera vez que aparece en este documento:** `pnl_concentration`
+juzga por `top_3` y aquí devolvía "concentración aceptable" con el 98 % del P&L en diez
+operaciones. El criterio del checklist se reescribió sobre `top_10 < 50 %` y pasó a ser de veto.
+Un helper que resume bien el caso corriente puede dar un OK falso en el caso extremo — y el caso
+extremo es justo donde importa.
+
+Veredicto de rentabilidad: **2 de 7 criterios críticos**. Lo que la tasa de acierto del 52 %
+insinuaba como "casi nada", la medición de P&L lo confirma como "nada, sostenido por diez días
+y un supuesto de costes optimista".

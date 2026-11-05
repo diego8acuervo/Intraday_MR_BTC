@@ -1,6 +1,6 @@
 from __future__ import print_function
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, getcontext, ROUND_HALF_DOWN
 import json
 import logging
@@ -299,22 +299,64 @@ class IBKRPriceHandler(PriceHandler):
 
     Mantiene la interfaz de PriceHandler para ser intercambiable dentro del
     bucle de trading, igual que StreamingBitgetPrices.
+
+    Instrumentos (`sec_type`): `FUT` (front month del CME, p. ej. MBT), `CFD`
+    (p. ej. IBIT por SMART: se opera el CFD y las barras salen de la acción
+    subyacente, porque IBKR no da histórico de CFDs) o `STK`.
+
+    Dos formas de obtener las barras (`bar_mode`):
+
+    * `stream`: suscripción `keepUpToDate`. Depende de que IBKR empuje
+      actualizaciones, cosa que sin suscripción de datos en tiempo real puede
+      no pasar nunca (medido con IBIT: 0 actualizaciones en 20 s).
+    * `poll`: un `reqHistoricalData` normal justo después de cada cierre de
+      barra, solo con la sesión abierta. El histórico de IBKR no va diferido
+      aunque la cuenta no tenga tiempo real (medido: a las 14:44 UTC ya
+      estaba la barra de 14:30), y no hay suscripción de barras que se pueda
+      quedar muda, así que tampoco hay nada que resuscribir.
     """
 
     _MAX_CONSECUTIVE_PUMP_ERRORS = 5
     _STALE_CHECK_EVERY_S = 60      # cadencia de la comprobación de obsolescencia
     _MAX_TICK_STALE_S = 120        # sin un tick en 2 min: la línea está muerta
-    _MAX_BAR_STALE_FACTOR = 1.5    # 1.5x el tamaño de barra sin barra nueva
+    # Edad máxima de la última barra publicada, medida desde su INICIO y en
+    # múltiplos del tamaño de barra. Con el feed sano llega a 2x por
+    # construcción: la barra que empieza en T cierra en T+1x, pero solo se
+    # publica cuando aparece la siguiente, y la siguiente a esa en T+2x. El
+    # 1x extra cubre el retraso de los datos diferidos (marketDataType=3,
+    # ~10-15 min). Con 1.5x el watchdog saltaba 15 min antes de CADA cierre
+    # con el feed sano, y al reabrir la suscripción tiraba la barra en camino.
+    _MAX_BAR_STALE_FACTOR = 3.0
     _RESUBSCRIBE_COOLDOWN_S = 300  # no reintentar más de 1 vez cada 5 min
+    # Con un error de permisos de datos (10089, 10197...) resuscribir no
+    # arregla nada: se reintenta con mucha menos frecuencia.
+    _ENTITLEMENT_COOLDOWN_S = 1800
+    _POLL_DELAY_S = 5              # tras el cierre, margen para que IBKR la tenga
+    _POLL_RETRY_S = 15             # si la barra aún no está, reintento...
+    _POLL_GIVE_UP_S = 180          # ...hasta 3 min; luego, al siguiente cierre
+    _SESSIONS_REFRESH_S = 6 * 3600
+    # Errores de IBKR que dicen "no hay datos para ti", no "se cayó la línea".
+    _MD_ENTITLEMENT_CODES = {354, 10089, 10090, 10167, 10168, 10186, 10197}
+    _BAR_SECS = {"1 secs": 1, "5 secs": 5, "10 secs": 10, "15 secs": 15,
+                 "30 secs": 30, "1 min": 60, "5 mins": 300, "15 mins": 900,
+                 "30 mins": 1800, "1 hour": 3600, "1 day": 86400}
 
     def __init__(self, pairs, events_queue, ib=None, exchange="CME",
                  currency="USD", bar_size="30 mins", use_rth=True,
                  what_to_show="TRADES", warmup_bars=120, roll_days=2,
-                 market_data_type=None, account=None):
+                 market_data_type=None, account=None, sec_type="FUT",
+                 bar_mode="stream", tick_source="trade"):
+        if bar_mode not in ("stream", "poll"):
+            raise ValueError("bar_mode debe ser 'stream' o 'poll'")
+        if tick_source not in ("trade", "data"):
+            raise ValueError("tick_source debe ser 'trade' o 'data'")
         self.pairs = pairs
         self.events_queue = events_queue
         self.exchange = exchange
         self.currency = currency
+        self.sec_type = sec_type.upper()
+        self.bar_mode = bar_mode
+        self.tick_source = tick_source
         self.bar_size = bar_size
         self.use_rth = use_rth
         self.what_to_show = what_to_show
@@ -324,12 +366,20 @@ class IBKRPriceHandler(PriceHandler):
         self.prices = {}
         self._set_up_prices_dict()
 
-        self.contracts = {}
+        self.contracts = {}        # contrato que se OPERA (FUT / CFD / STK)
+        self.data_contracts = {}   # contrato de las BARRAS (el subyacente de un CFD)
         self.specs = {}
+        self.sessions = {}         # pair -> TradingSessions (UTC)
+        self._sessions_at = None
         self.history = {}
         self._bar_subs = {}
         self._tickers = {}
         self._last_bar_time = {}
+        self._next_poll_at = {}
+        self._poll_deadline = {}
+        # Último error de permisos de datos por símbolo: (código, mensaje, cuándo).
+        self.md_errors = {}
+        self._synthetic_warned = set()
         # Marca de tiempo REAL (datetime, no el string de `self.prices`) del
         # último tick y del último bombeo del loop de ib_async — lo que el
         # monitor necesita para distinguir "el feed está vivo pero tranquilo"
@@ -373,30 +423,92 @@ class IBKRPriceHandler(PriceHandler):
             self.logger.warning(
                 "marketDataType=%s (no es tiempo real): la MAE se mide sobre "
                 "precios viejos y queda infravalorada.", self.market_data_type)
+        self.ib.errorEvent += self._on_ib_error
         self.resolve_contracts()
 
     def resolve_contracts(self):
-        """Front month por símbolo, resuelto contra IB, nunca hardcodeado.
+        """Contratos por símbolo, resueltos contra IB, nunca hardcodeados.
 
-        Reutiliza `front_month` con el mismo `min_days` que el backtest para que
-        vivo y backtest operen exactamente el mismo vencimiento.
+        FUT reutiliza `front_month` con el mismo `min_days` que el backtest
+        para que vivo y backtest operen exactamente el mismo vencimiento. CFD
+        opera el CFD y toma las barras del subyacente (`resolve_instrument`).
         """
-        from qsCrypto.ibkr.contracts import front_month
+        from qsCrypto.ibkr.contracts import resolve_instrument
+        from qsCrypto.ibkr.sessions import TradingSessions, utcnow_naive
         for pair in self.pairs:
-            contract, detail, expiry = front_month(
-                self.ib, pair, self.exchange, self.currency,
-                min_days=self.roll_days)
+            contract, detail, data_contract, data_detail, expiry = \
+                resolve_instrument(self.ib, pair, self.sec_type, self.exchange,
+                                   self.currency, min_days=self.roll_days)
             self.contracts[pair] = contract
+            self.data_contracts[pair] = data_contract
             self.specs[pair] = {
                 "multiplier": float(contract.multiplier or 1.0),
                 "minTick": float(detail.minTick),
                 "expiry": expiry,
                 "localSymbol": contract.localSymbol,
+                "secType": contract.secType,
+                "dataSymbol": data_contract.localSymbol,
+                # Órdenes fuera de la sesión regular: sí en el futuro y en
+                # divisas (CME e IDEALPRO cotizan casi 24 h y el stop debe
+                # proteger siempre), NO en CFD/acción: el backtest solo ve
+                # barras RTH, y un stop que saltara con un print del
+                # pre-market sería una salida que el backtest nunca modeló.
+                "outside_rth": contract.secType in ("FUT", "CASH"),
             }
-            self.logger.info("%s -> %s multiplier=%s minTick=%s expiry=%s",
-                             pair, contract.localSymbol,
-                             self.specs[pair]["multiplier"],
-                             self.specs[pair]["minTick"], expiry)
+            self.sessions[pair] = TradingSessions.from_details(
+                data_detail, use_rth=self.use_rth)
+            self.logger.info(
+                "%s -> %s (%s) multiplier=%s minTick=%s expiry=%s barras de %s "
+                "%s | %r", pair, contract.localSymbol, contract.secType,
+                self.specs[pair]["multiplier"], self.specs[pair]["minTick"],
+                expiry, data_contract.localSymbol, data_contract.secType,
+                self.sessions[pair])
+        self._sessions_at = utcnow_naive()
+
+    def _refresh_sessions(self, now):
+        """El calendario de IBKR cubre ~una semana: se renueva cada pocas
+        horas. Un fallo no es grave — fuera del horizonte conocido el mercado
+        se trata como abierto, que es el comportamiento anterior."""
+        if self._sessions_at is not None and \
+                (now - self._sessions_at).total_seconds() < self._SESSIONS_REFRESH_S:
+            return
+        from qsCrypto.ibkr.sessions import TradingSessions
+        self._sessions_at = now
+        for pair in self.pairs:
+            try:
+                det = self.ib.reqContractDetails(self.data_contracts[pair])
+                if det:
+                    self.sessions[pair] = TradingSessions.from_details(
+                        det[0], use_rth=self.use_rth)
+            except Exception as exc:
+                self.logger.warning("No se pudo renovar el calendario de %s: %s",
+                                    pair, exc)
+
+    def market_open(self, pair, now):
+        """True/False según el calendario; True si el calendario no cubre
+        `now` (sin información, se vigila como si estuviera abierto)."""
+        sess = self.sessions.get(pair)
+        if sess is None or not sess.covers(now):
+            return True
+        return sess.is_open(now)
+
+    def _on_ib_error(self, reqId, errorCode, errorString, contract=None, *args):
+        """Guarda los errores de permisos de datos por símbolo: son la causa
+        real de un feed mudo y el watchdog los usa para no martillear."""
+        if errorCode not in self._MD_ENTITLEMENT_CODES or contract is None:
+            return
+        pair = self._pair_of_contract(contract)
+        if pair is None:
+            return
+        from qsCrypto.ibkr.sessions import utcnow_naive
+        first = pair not in self.md_errors or self.md_errors[pair][0] != errorCode
+        self.md_errors[pair] = (errorCode, errorString, utcnow_naive())
+        if first:
+            self.logger.critical(
+                "Sin datos de mercado en vivo para %s (%s): error %s — %s. "
+                "Revisa la suscripción de datos para API o cierra la sesión "
+                "live competidora (TWS/app/web con el mismo usuario).",
+                pair, getattr(contract, "localSymbol", ""), errorCode, errorString)
 
     def _set_up_prices_dict(self):
         # Sin los pares inversos de forex de la clase base: un futuro no tiene
@@ -410,16 +522,28 @@ class IBKRPriceHandler(PriceHandler):
 
         Sin esto harían falta `atr_period + entry_bars` barras nuevas antes de
         la primera señal — a 30 minutos, más de una jornada a ciegas.
+
+        La ÚLTIMA barra que devuelve IBKR se descarta: en sesión es la barra
+        en curso, con máximo y mínimo provisionales. Arrancando a las 13:55
+        UTC llegaba la de 13:30 a medio formar; la estrategia se sembraba con
+        ella y, al cerrar, la barra real de 13:30 se descartaba por no ser
+        más nueva que `_last_bar_time`: la estrategia no la veía nunca.
+        Se usa la misma regla estructural que en el streaming —la última
+        barra está en curso hasta que aparece otra detrás— y no el reloj,
+        que con datos diferidos daría por cerrada una barra aún incompleta.
+        Fuera de sesión la barra descartada sí estaba cerrada; se publica en
+        cuanto aparezca la primera de la sesión siguiente, igual que si
+        hubiera llegado en vivo.
         """
         import pandas as pd
         from ib_async import util
         for pair in self.pairs:
             bars = self.ib.reqHistoricalData(
-                self.contracts[pair], endDateTime="",
+                self.data_contracts[pair], endDateTime="",
                 durationStr=self._duration_for(self.warmup_bars),
                 barSizeSetting=self.bar_size, whatToShow=self.what_to_show,
                 useRTH=self.use_rth, formatDate=2, timeout=60)
-            if not bars:
+            if len(bars) < 2:                  # la última se descarta abajo
                 raise RuntimeError(
                     "Sin histórico para %s (%s, %s). En divisas whatToShow="
                     "'TRADES' vuelve vacío: usa MIDPOINT." % (
@@ -427,6 +551,13 @@ class IBKRPriceHandler(PriceHandler):
             df = util.df(bars).rename(columns={"date": "time"})
             df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
             df = df.set_index("time").sort_index()
+            if self.bar_mode == "poll":
+                # Misma regla que el sondeo: fuera de sesión la última barra
+                # ya terminó y es historia válida.
+                now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+                df = df[df.index + pd.Timedelta(seconds=self._bar_secs()) <= now]
+            else:
+                df = df.iloc[:-1]
             cols = [c for c in ("open", "high", "low", "close", "volume")
                     if c in df.columns]
             self.history[pair] = df[cols].astype(float)
@@ -437,11 +568,11 @@ class IBKRPriceHandler(PriceHandler):
                              self.history[pair].index[-1])
         return self.history
 
+    def _bar_secs(self):
+        return self._BAR_SECS.get(self.bar_size, 1800)
+
     def _duration_for(self, n_bars):
-        secs = {"1 secs": 1, "5 secs": 5, "10 secs": 10, "15 secs": 15,
-                "30 secs": 30, "1 min": 60, "5 mins": 300, "15 mins": 900,
-                "30 mins": 1800, "1 hour": 3600, "1 day": 86400
-                }.get(self.bar_size, 1800)
+        secs = self._bar_secs()
         if secs < 60:
             # IBKR limita la duración de peticiones de barras SUB-MINUTO a
             # más o menos 1 día (28.800s para 30 segs, menos para tamaños
@@ -459,32 +590,111 @@ class IBKRPriceHandler(PriceHandler):
 
     # ── streaming ───────────────────────────────────────────────────────────
     def _on_bar_update(self, bars, has_new_bar):
-        """Solo publica la barra ANTERIOR a la que está en curso."""
-        if not has_new_bar or len(bars) < 2:
-            return
+        """Callback de `keepUpToDate`: publica toda barra cerrada pendiente.
+
+        Deliberadamente NO depende de `has_new_bar`: ib_async solo lo marca
+        cuando la barra nueva llega como actualización de una suscripción
+        ya abierta. Si la suscripción se reabre (watchdog) y la barra nueva
+        viene en la carga inicial —lo normal con datos diferidos, que la
+        entregan minutos después del cierre—, `has_new_bar` nunca es True
+        para ella y se perdía. Comparar contra `_last_bar_time` sobre la
+        lista entera es idempotente y no pierde nada.
+        """
+        pair = getattr(bars, "_qs_pair", None) or self._pair_of(bars)
+        if pair is not None:
+            self._publish_closed_bars(pair, bars)
+
+    def _publish_closed_bars(self, pair, bars, now=None):
+        """Publica, en orden, las barras cerradas posteriores a la última
+        publicada. Devuelve cuántas.
+
+        Qué barra está cerrada:
+        * modo `stream` (`now=None`): regla estructural, `bars[-1]` es la
+          barra en curso hasta que aparece otra detrás;
+        * modo `poll` (`now` dado): la que ya terminó (`inicio + tamaño <=
+          now`). El histórico que se sondea no va diferido, y así la última
+          barra de la sesión se publica al cierre (16:00 ET en IBIT), no a
+          la mañana siguiente cuando aparece la primera de la nueva sesión.
+
+        Si hay más de una pendiente (hueco del feed, reapertura de la
+        suscripción), solo la más reciente es operable; las anteriores van
+        con `backfill=True`: completan N y el canal, pero una señal sobre
+        ellas se ejecutaría a precio de ahora con información vieja.
+
+        Sin ticks en vivo para el símbolo, cada barra va precedida de ticks
+        sintéticos de su máximo, mínimo y cierre (`_bar_ticks`).
+        """
         try:
             import pandas as pd
-            pair = getattr(bars, "_qs_pair", None) or self._pair_of(bars)
-            if pair is None:
-                return
-            b = bars[-2]                       # -1 es la barra viva
-            ts = pd.Timestamp(b.date)
-            if ts.tzinfo is not None:
-                ts = ts.tz_convert("UTC").tz_localize(None)
-            if self._last_bar_time.get(pair) is not None and \
-                    ts <= self._last_bar_time[pair]:
-                return
-            self._last_bar_time[pair] = ts
-            self.history[pair].loc[ts] = [
-                float(b.open), float(b.high), float(b.low), float(b.close),
-                float(getattr(b, "volume", 0.0) or 0.0),
-            ][:len(self.history[pair].columns)]
-            self.events_queue.put(BarEvent(
-                pair, ts, float(b.open), float(b.high), float(b.low),
-                float(b.close), float(getattr(b, "volume", 0.0) or 0.0),
-                complete=True))
+            bar_td = pd.Timedelta(seconds=self._bar_secs())
+            last = self._last_bar_time.get(pair)
+            candidates = bars if now is not None else bars[:-1]
+            fresh = []
+            for b in reversed(candidates):
+                ts = pd.Timestamp(b.date)
+                if ts.tzinfo is not None:
+                    ts = ts.tz_convert("UTC").tz_localize(None)
+                if last is not None and ts <= last:
+                    break
+                if now is not None and ts + bar_td > pd.Timestamp(now):
+                    continue                   # aún en curso
+                fresh.append((ts, b))
+            if not fresh:
+                return 0
+            fresh.reverse()
+            if len(fresh) > 1:
+                self.logger.warning(
+                    "%s: %d barras cerradas llegan juntas (%s -> %s); solo la "
+                    "última es operable, el resto se publica como backfill.",
+                    pair, len(fresh), fresh[0][0], fresh[-1][0])
+            live_ticks = self._ticks_live(pair)
+            for i, (ts, b) in enumerate(fresh):
+                vol = float(getattr(b, "volume", 0.0) or 0.0)
+                self._last_bar_time[pair] = ts
+                self.history[pair].loc[ts] = [
+                    float(b.open), float(b.high), float(b.low), float(b.close),
+                    vol,
+                ][:len(self.history[pair].columns)]
+                if not live_ticks:
+                    self._bar_ticks(pair, ts + bar_td, b)
+                self.events_queue.put(BarEvent(
+                    pair, ts, float(b.open), float(b.high), float(b.low),
+                    float(b.close), vol, complete=True,
+                    backfill=i < len(fresh) - 1))
+            return len(fresh)
         except Exception as exc:
             self.logger.error("Error procesando barra: %s", exc)
+            return 0
+
+    def _ticks_live(self, pair):
+        tick_at = self.last_tick_at.get(pair)
+        return tick_at is not None and (
+            datetime.now(timezone.utc) - tick_at).total_seconds() <= self._MAX_TICK_STALE_S
+
+    def _bar_ticks(self, pair, bar_end, b):
+        """Sin ticks en vivo (sin suscripción de datos, o sesión live
+        competidora: IBKR 10089/10197), el portfolio se quedaría sin precio:
+        `_ref_price` devuelve None y NINGUNA señal se opera, y el MAE nunca se
+        actualiza. Se marca al máximo, al mínimo y al cierre de la barra, en
+        ese orden — el precio vigente queda en el cierre y la excursión de
+        las posiciones abiertas recoge los dos extremos. Van ANTES del
+        BarEvent: una entrada que ese BarEvent dispare no debe ver los
+        extremos de una barra anterior a su fill. Es MAE a resolución de
+        barra, no de tick: queda dicho en el log una vez por símbolo.
+        """
+        if pair not in self._synthetic_warned:
+            self._synthetic_warned.add(pair)
+            self.logger.warning(
+                "%s: sin ticks en vivo. Precio de referencia y MAE/MFE a "
+                "resolución de BARRA (máximo, mínimo, cierre) hasta que "
+                "vuelvan los ticks.", pair)
+        tval = bar_end.isoformat()
+        for px in (b.high, b.low, b.close):
+            d = Decimal(str(float(px))).quantize(Decimal("0.00001"))
+            self.prices[pair]["bid"] = d
+            self.prices[pair]["ask"] = d
+            self.prices[pair]["time"] = tval
+            self.events_queue.put(TickEvent(pair, tval, d, d))
 
     def _pair_of(self, bars):
         for pair, sub in self._bar_subs.items():
@@ -515,30 +725,53 @@ class IBKRPriceHandler(PriceHandler):
                 self.prices[pair]["bid"] = bid_d
                 self.prices[pair]["ask"] = ask_d
                 self.prices[pair]["time"] = tval
+                if self.last_tick_at.get(pair) is None:
+                    self.logger.info("%s: primer tick en vivo (marketDataType=%s).",
+                                     pair, getattr(tk, "marketDataType", "?"))
                 self.last_tick_at[pair] = datetime.now(timezone.utc)
+                self.md_errors.pop(pair, None)
                 self.events_queue.put(TickEvent(pair, tval, bid_d, ask_d))
             except Exception as exc:
                 self.logger.error("Error procesando ticker: %s", exc)
 
     def _pair_of_contract(self, contract):
-        for pair, c in self.contracts.items():
-            if c.conId == contract.conId:
-                return pair
+        for pair in self.pairs:
+            for c in (self.contracts.get(pair), self.data_contracts.get(pair)):
+                if c is not None and c.conId == contract.conId:
+                    return pair
         return None
+
+    def _tick_contract(self, pair):
+        return (self.contracts[pair] if self.tick_source == "trade"
+                else self.data_contracts[pair])
 
     def subscribe(self):
         for pair in self.pairs:
-            tk = self.ib.reqMktData(self.contracts[pair], "", False, False)
-            self._tickers[pair] = tk
+            self._tickers[pair] = self.ib.reqMktData(
+                self._tick_contract(pair), "", False, False)
+            if self.bar_mode != "stream":
+                continue                       # en `poll` no hay suscripción de barras
             bars = self.ib.reqHistoricalData(
-                self.contracts[pair], endDateTime="",
+                self.data_contracts[pair], endDateTime="",
                 durationStr=self._duration_for(50),
                 barSizeSetting=self.bar_size, whatToShow=self.what_to_show,
                 useRTH=self.use_rth, formatDate=2, keepUpToDate=True, timeout=60)
             bars._qs_pair = pair
             self._bar_subs[pair] = bars
+            # La carga inicial no dispara `updateEvent`: lo que haya cerrado
+            # mientras la suscripción anterior estaba cancelada (o entre el
+            # calentamiento y este punto) se publica aquí o no se publica.
+            self._publish_closed_bars(pair, bars)
             bars.updateEvent += self._on_bar_update
         self.ib.pendingTickersEvent += self._on_pending_tickers
+
+    def _cancel_tickers(self):
+        for pair, tk in list(self._tickers.items()):
+            try:
+                self.ib.cancelMktData(tk.contract)
+            except Exception:
+                pass
+        self._tickers.clear()
 
     def _unsubscribe_quietly(self):
         """Cancela lo que haya, tragándose los fallos: es limpieza antes de
@@ -553,60 +786,163 @@ class IBKRPriceHandler(PriceHandler):
                 self.ib.cancelHistoricalData(bars)
             except Exception:
                 pass
-        for pair in list(self._tickers):
-            try:
-                self.ib.cancelMktData(self.contracts[pair])
-            except Exception:
-                pass
+        self._cancel_tickers()
         self._bar_subs.clear()
-        self._tickers.clear()
 
     def _resubscribe(self):
         self._unsubscribe_quietly()
         self.subscribe()
+
+    def _resubscribe_ticks(self):
+        """En modo `poll` la única suscripción viva es la de ticks: se
+        reabre solo esa, las barras no se tocan."""
+        self._cancel_tickers()
+        for pair in self.pairs:
+            self._tickers[pair] = self.ib.reqMktData(
+                self._tick_contract(pair), "", False, False)
 
     def _check_staleness(self, now):
         """Detecta un feed muerto SIN excepción — el caso que el reintento
         de `stream_to_queue` no cubre. Un farm de datos de IBKR puede
         dejar de entregar ticks/barras sin que `ib.sleep()` lance nada: el
         bombeo sigue "sano" (`last_pump_at` se actualiza cada segundo) pero
-        no llega un solo dato nuevo. Se comprueba cada
-        `_STALE_CHECK_EVERY_S` segundos y, si hace más de
-        `_MAX_TICK_STALE_S` que no llega un tick o más de
-        `_MAX_BAR_STALE_FACTOR` veces el tamaño de barra que no cierra una,
-        se fuerza una resuscripción — con un enfriamiento mínimo entre
-        intentos para no entrar en una tormenta de reqMktData si el mercado
-        de verdad está cerrado (mantenimiento diario del CME, fin de
-        semana).
+        no llega un solo dato nuevo.
+
+        Solo se vigila con el mercado ABIERTO según el calendario del
+        contrato: antes, con la sesión cerrada (noche, fin de semana,
+        mantenimiento del CME) cada comprobación declaraba el feed muerto y
+        reabría suscripciones cada 5 minutos hasta la apertura. Las edades se
+        miden desde la apertura de la sesión si esta es más reciente que el
+        último dato.
+
+        * ticks: más de `_MAX_TICK_STALE_S` sin uno;
+        * barras (solo modo `stream`): la última publicada empezó hace más de
+          `_MAX_BAR_STALE_FACTOR` barras. En modo `poll` no hay suscripción de
+          barras que pueda quedarse muda: el sondeo reintenta por su cuenta.
+
+        Si la causa conocida es un error de permisos de datos (10089, 10197…)
+        se reintenta cada `_ENTITLEMENT_COOLDOWN_S`, no cada 5 minutos:
+        resuscribir no concede una suscripción que la cuenta no tiene.
         """
-        bar_secs = {"1 min": 60, "5 mins": 300, "15 mins": 900,
-                    "30 mins": 1800, "1 hour": 3600, "1 day": 86400
-                    }.get(self.bar_size, 1800)
+        now_n = now.replace(tzinfo=None)
+        self._refresh_sessions(now_n)
+        bar_secs = self._bar_secs()
         stale_pairs = []
         for pair in self.pairs:
+            if not self.market_open(pair, now_n):
+                continue
+            sess = self.sessions.get(pair)
+            cur = sess.current(now_n) if sess is not None and sess.covers(now_n) else None
+            opened = cur[0] if cur is not None else None
+
             tick_at = self.last_tick_at.get(pair)
-            tick_stale = (tick_at is None or
-                         (now - tick_at).total_seconds() > self._MAX_TICK_STALE_S)
+            tick_ref = tick_at.replace(tzinfo=None) if tick_at is not None else None
+            if opened is not None:
+                tick_ref = opened if tick_ref is None else max(tick_ref, opened)
+            tick_stale = (tick_ref is None or
+                          (now_n - tick_ref).total_seconds() > self._MAX_TICK_STALE_S)
+
+            bar_stale = False
             last_bar_ts = self._last_bar_time.get(pair)
-            bar_stale = (last_bar_ts is not None and
-                        (now.replace(tzinfo=None) - last_bar_ts).total_seconds()
-                        > bar_secs * self._MAX_BAR_STALE_FACTOR)
+            if self.bar_mode == "stream" and last_bar_ts is not None:
+                bar_ref = last_bar_ts
+                if opened is not None and bar_ref < opened:
+                    bar_ref = opened - timedelta(seconds=bar_secs)
+                bar_stale = ((now_n - bar_ref).total_seconds()
+                             > bar_secs * self._MAX_BAR_STALE_FACTOR)
             if tick_stale or bar_stale:
                 stale_pairs.append(pair)
         if not stale_pairs:
             return
+        known = all(p in self.md_errors for p in stale_pairs)
+        cooldown = self._ENTITLEMENT_COOLDOWN_S if known else self._RESUBSCRIBE_COOLDOWN_S
         if (self._last_resubscribe_at is not None and
-                (now - self._last_resubscribe_at).total_seconds()
-                < self._RESUBSCRIBE_COOLDOWN_S):
+                (now - self._last_resubscribe_at).total_seconds() < cooldown):
             return
-        self.logger.critical(
-            "Feed obsoleto sin excepción en %s (posible farm de IBKR caído "
-            "en silencio): reabriendo suscripciones.", stale_pairs)
+        if known:
+            self.logger.warning(
+                "Sin ticks en %s por permisos de datos (%s): se reintenta cada "
+                "%d min.", stale_pairs,
+                {p: self.md_errors[p][0] for p in stale_pairs}, cooldown // 60)
+        else:
+            self.logger.critical(
+                "Feed obsoleto sin excepción en %s con el mercado abierto "
+                "(posible farm de IBKR caído en silencio): reabriendo "
+                "suscripciones.", stale_pairs)
         self._last_resubscribe_at = now
         try:
-            self._resubscribe()
+            if self.bar_mode == "poll":
+                self._resubscribe_ticks()
+            else:
+                self._resubscribe()
         except Exception as exc:
             self.logger.critical("Reabrir suscripciones también falló: %s", exc)
+
+    # ── sondeo de barras (bar_mode="poll") ──────────────────────────────────
+    def _poll_due(self, pair, now):
+        """Próximo sondeo tras `now`: el siguiente cierre de barra CON LA
+        SESIÓN ABIERTA, más `_POLL_DELAY_S`. Si la sesión termina antes del
+        siguiente corte (cierre anticipado), el cierre de sesión manda."""
+        from qsCrypto.ibkr.sessions import floor_to
+        step = timedelta(seconds=self._bar_secs())
+        boundary = floor_to(now, self._bar_secs()) + step
+        sess = self.sessions.get(pair)
+        if sess is not None and sess.covers(now):
+            cur = sess.current(now)
+            if cur is not None:
+                boundary = min(boundary, cur[1])
+            else:
+                nxt = sess.next_open(now)
+                if nxt is not None:
+                    boundary = floor_to(nxt, self._bar_secs()) + step
+        return boundary + timedelta(seconds=self._POLL_DELAY_S)
+
+    def _poll_once(self, pair, now):
+        last = self._last_bar_time.get(pair)
+        days = 2 if last is None else max(2, (now - last).days + 2)
+        bars = self.ib.reqHistoricalData(
+            self.data_contracts[pair], endDateTime="",
+            durationStr="%d D" % min(days, 30),
+            barSizeSetting=self.bar_size, whatToShow=self.what_to_show,
+            useRTH=self.use_rth, formatDate=2, timeout=30)
+        return self._publish_closed_bars(pair, list(bars or []), now=now)
+
+    def _poll_step(self, now):
+        """Sondea los símbolos a los que les toca. La barra esperada es la
+        que termina en el corte programado; si IBKR aún no la tiene se
+        reintenta cada `_POLL_RETRY_S` hasta `_POLL_GIVE_UP_S`, y si no
+        aparece se pasa al siguiente corte (que la recogerá como backfill)."""
+        from qsCrypto.ibkr.sessions import floor_to
+        for pair in self.pairs:
+            due = self._next_poll_at.get(pair)
+            if due is None:
+                self._next_poll_at[pair] = self._poll_due(pair, now)
+                continue
+            if now < due:
+                continue
+            boundary = self._poll_deadline.get(pair, (None, None))[0] or \
+                due - timedelta(seconds=self._POLL_DELAY_S)
+            expected = floor_to(boundary - timedelta(seconds=1), self._bar_secs())
+            try:
+                self._poll_once(pair, now)
+            except Exception as exc:
+                self.logger.error("Sondeo de barras de %s falló: %s", pair, exc)
+            last = self._last_bar_time.get(pair)
+            if last is not None and last >= expected:
+                self._poll_deadline.pop(pair, None)
+                self._next_poll_at[pair] = self._poll_due(pair, now)
+                continue
+            b0, give_up = self._poll_deadline.setdefault(
+                pair, (boundary, boundary + timedelta(seconds=self._POLL_GIVE_UP_S)))
+            if now >= give_up:
+                self.logger.warning(
+                    "%s: la barra de %s no apareció en %d s de sondeo; se "
+                    "recogerá en el próximo corte.", pair, expected,
+                    self._POLL_GIVE_UP_S)
+                self._poll_deadline.pop(pair, None)
+                self._next_poll_at[pair] = self._poll_due(pair, now)
+            else:
+                self._next_poll_at[pair] = now + timedelta(seconds=self._POLL_RETRY_S)
 
     def stream_to_queue(self):
         """Bombea el loop de ib_async. Es el ÚNICO hilo que lo hace.
@@ -621,7 +957,8 @@ class IBKRPriceHandler(PriceHandler):
         suscripción se cayó en el bróker no se repara solo con reintentar el
         `sleep`. Eso cubre el bombeo roto; `_check_staleness` cubre el otro
         caso, más traicionero: el bombeo sigue sano pero la suscripción dejó
-        de entregar datos sin lanzar nada.
+        de entregar datos sin lanzar nada. En modo `poll`, este mismo hilo
+        sondea las barras en cada cierre (`_poll_step`).
         """
         if not self.history:
             self.warmup()
@@ -630,7 +967,8 @@ class IBKRPriceHandler(PriceHandler):
         self.last_pump_at = datetime.now(timezone.utc)
         self._last_resubscribe_at = None
         last_stale_check = self.last_pump_at
-        self.logger.info("Streaming IBKR arrancado sobre %s", self.pairs)
+        self.logger.info("Streaming IBKR arrancado sobre %s (barras: %s, ticks: %s)",
+                         self.pairs, self.bar_mode, self.tick_source)
         consecutive_errors = 0
         while self._running:
             try:
@@ -657,6 +995,11 @@ class IBKRPriceHandler(PriceHandler):
                 continue
 
             now = self.last_pump_at
+            if self.bar_mode == "poll":
+                try:
+                    self._poll_step(now.replace(tzinfo=None))
+                except Exception as exc:
+                    self.logger.error("Error en el sondeo de barras: %s", exc)
             if (now - last_stale_check).total_seconds() >= self._STALE_CHECK_EVERY_S:
                 last_stale_check = now
                 self._check_staleness(now)
@@ -667,7 +1010,7 @@ class IBKRPriceHandler(PriceHandler):
             self.ib.pendingTickersEvent -= self._on_pending_tickers
             for pair, bars in self._bar_subs.items():
                 self.ib.cancelHistoricalData(bars)
-            for pair in list(self._tickers):
-                self.ib.cancelMktData(self.contracts[pair])
+            for pair, tk in list(self._tickers.items()):
+                self.ib.cancelMktData(tk.contract)
         except Exception as exc:
             self.logger.error("Error cerrando suscripciones: %s", exc)

@@ -623,6 +623,13 @@ class IBKRExecutionHandler(ExecutionHandler):
         self.parents = {}        # pair -> Trade del padre
         self._seen_execs = set()
         self._pending_add = {}   # orderId -> bool(is_add)
+        # Neto PROPIO por símbolo y cuenta, acumulado de las ejecuciones que
+        # llegan por execDetails: {pair: {cuenta: cantidad con signo}}. Es la
+        # única fuente de posición en divisas al contado — IBKR no reporta
+        # esas posiciones en `reqPositions` (son saldos en divisa) — y es
+        # prueba POSITIVA: lo que este proceso abrió y aún no cerró.
+        self.net = {}
+        self._closing = {}       # pair -> [Trade] de cierres enviados por flatten
         self.ib.execDetailsEvent += self._on_exec_details
 
     # ── utilidades de contrato ──────────────────────────────────────────────
@@ -662,11 +669,18 @@ class IBKRExecutionHandler(ExecutionHandler):
         # posición sin barrera de bróker justo cuando más importa (el motor
         # puede estar caído, ver streaming.py/trading.py). GTC explícito en
         # ambos evita depender de qué preset tenga la cuenta en TWS.
+        # Fuera de la sesión regular solo en futuros: en un CFD/acción el
+        # backtest ve barras RTH, y un stop disparado por un print del
+        # pre-market sería una salida que nunca modeló. Con `outsideRth=False`
+        # una entrada a mercado enviada tras el cierre (señal en la última
+        # barra de la sesión) queda en cola GTC hasta la apertura siguiente:
+        # el mismo "fill al open de la barra siguiente" del backtest.
+        outside_rth = bool(self.specs.get(pair, {}).get("outside_rth", True))
         parent = MarketOrder(action, qty)
         parent.orderId = self.ib.client.getReqId()
         parent.account = self.account
         parent.transmit = stop_px is None
-        parent.outsideRth = True
+        parent.outsideRth = outside_rth
         parent.tif = "GTC"
 
         trades = [self.ib.placeOrder(contract, parent)]
@@ -679,7 +693,7 @@ class IBKRExecutionHandler(ExecutionHandler):
             stop.account = self.account
             stop.parentId = parent.orderId
             stop.transmit = True
-            stop.outsideRth = True
+            stop.outsideRth = outside_rth
             stop.tif = "GTC"
             trades.append(self.ib.placeOrder(contract, stop))
             self.stops[pair] = trades[-1]
@@ -716,6 +730,8 @@ class IBKRExecutionHandler(ExecutionHandler):
         """
         from ib_async import MarketOrder
         contract = self.contracts[pair]
+        if self.specs.get(pair, {}).get("secType") == "CASH":
+            return self._flatten_cash(pair, contract, reason)
         for o in self.ib.reqOpenOrders():
             if o.contract.conId == contract.conId:
                 self.ib.cancelOrder(o.order)
@@ -738,6 +754,55 @@ class IBKRExecutionHandler(ExecutionHandler):
                                  p.position, pair, p.account, reason)
         return flat
 
+    def _flatten_cash(self, pair, contract, reason):
+        """Aplana divisas al contado desde el neto PROPIO, no desde
+        `ib.positions()`.
+
+        Medido: con 25.000 EUR vivos, tres pasadas de `reqPositions` no
+        devolvieron una sola fila con cantidad ≠ 0 — en IDEALPRO la posición
+        es un saldo en divisa. El `flatten` genérico cancelaba el stop y
+        luego no encontraba nada que cerrar: la posición quedaba abierta y
+        SIN stop. Tampoco sirve el `CashBalance` en EUR: incluye cualquier
+        EUR que ya hubiera en la cuenta (sesiones anteriores).
+
+        Solo cierra lo que este proceso abrió. Si un cierre anterior aún no
+        se ha llenado, no manda otro: el neto no ha bajado todavía y un
+        segundo cierre abriría posición en sentido contrario.
+        """
+        from ib_async import MarketOrder
+        pending = [t for t in self._closing.get(pair, []) if not t.isDone()]
+        if pending:
+            self.logger.warning(
+                "%s: ya hay %d cierre(s) en curso; no se envía otro (%s).",
+                pair, len(pending), reason)
+            return 0
+        for o in self.ib.reqOpenOrders():
+            if o.contract.conId == contract.conId:
+                self.ib.cancelOrder(o.order)
+        self.ib.sleep(1.0)
+        self.stops.pop(pair, None)
+
+        flat = 0
+        closing = []
+        for acct, qty in sorted(self.net.get(pair, {}).items()):
+            if qty == 0:
+                continue
+            o = MarketOrder("SELL" if qty > 0 else "BUY", abs(int(qty)))
+            o.account = acct            # donde se ejecutó, no la configurada
+            o.tif = "GTC"
+            o.outsideRth = True
+            closing.append(self.ib.placeOrder(contract, o))
+            flat += int(qty)
+            self.logger.info("Aplanando %+d de %s en %s (%s, neto propio)",
+                             qty, pair, acct, reason)
+        self._closing[pair] = closing
+        if not closing:
+            self.logger.warning(
+                "%s: sin neto propio que cerrar (%s). Si hay divisa de "
+                "sesiones anteriores en la cuenta, ciérrala en TWS: este "
+                "proceso no puede distinguirla del saldo.", pair, reason)
+        return flat
+
     # ── fills de vuelta al bus ──────────────────────────────────────────────
     def _on_exec_details(self, trade, fill):
         try:
@@ -752,6 +817,9 @@ class IBKRExecutionHandler(ExecutionHandler):
                     break
             if pair is None:
                 return
+            signed = float(execution.shares) * (1 if execution.side == "BOT" else -1)
+            by_acct = self.net.setdefault(pair, {})
+            by_acct[execution.acctNumber] = by_acct.get(execution.acctNumber, 0.0) + signed
             comm = 0.0
             if getattr(fill, "commissionReport", None) is not None:
                 comm = float(getattr(fill.commissionReport, "commission", 0.0) or 0.0)

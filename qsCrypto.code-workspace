@@ -30,7 +30,8 @@
       "ms-python.python",
       "ms-python.vscode-pylance",
       "ms-toolsai.jupyter",
-      "mechatroner.rainbow-csv"
+      "mechatroner.rainbow-csv",
+      "tomoki1207.pdf"
     ]
   },
   "tasks": {

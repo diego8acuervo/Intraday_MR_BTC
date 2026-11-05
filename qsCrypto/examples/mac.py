@@ -9,14 +9,14 @@ from qsCrypto.data.price import HistoricCSVPriceHandler
 
 
 if __name__ == "__main__":
-    # Trade on GBP/USD and EUR/USD
+    # Bitcoin futures on CME
     pairs = ["MBT", "BRR"]
     
     # Create the strategy parameters for the
     # MovingAverageCrossStrategy
     strategy_params = {
-        "short_window": 500, 
-        "long_window": 2000
+        "short_window": 50, 
+        "long_window": 200
     }
    
     # Create and execute the backtest
